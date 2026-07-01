@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from dlc_testforge.extract_td import build_td_index, write_td_index
 from dlc_testforge.extract_spec import (
   build_spec_index,
   load_spec_index,
@@ -80,6 +81,19 @@ def cmd_extract_spec(args: argparse.Namespace) -> int:
   return 0
 
 
+def cmd_extract_td(args: argparse.Namespace) -> int:
+  try:
+    index = build_td_index(args.llvm_root)
+    write_td_index(index, args.out)
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  return 0
+
+
 def cmd_lookup_spec(args: argparse.Namespace) -> int:
   try:
     index = load_spec_index(args.index)
@@ -142,6 +156,18 @@ def build_parser() -> argparse.ArgumentParser:
     help="Path to write the DLC spec index JSON.",
   )
   extract_spec_parser.set_defaults(func=cmd_extract_spec)
+
+  extract_td_parser = subparsers.add_parser(
+    "extract-td", help="Extract DLC TableGen, intrinsic, builtin, and pass evidence."
+  )
+  _add_llvm_root(extract_td_parser)
+  extract_td_parser.add_argument(
+    "--out",
+    required=True,
+    type=Path,
+    help="Path to write the DLC TableGen/source evidence index JSON.",
+  )
+  extract_td_parser.set_defaults(func=cmd_extract_td)
 
   lookup_spec_parser = subparsers.add_parser(
     "lookup-spec", help="Search a DLC spec index JSON by topic."

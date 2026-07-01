@@ -14,6 +14,7 @@ def test_help_exits_without_llvm_checkout(capsys):
   assert "check-tools" in captured.out
   assert "index" in captured.out
   assert "extract-spec" in captured.out
+  assert "extract-td" in captured.out
   assert "lookup-spec" in captured.out
 
 
