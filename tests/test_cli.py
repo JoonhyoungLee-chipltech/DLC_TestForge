@@ -13,6 +13,8 @@ def test_help_exits_without_llvm_checkout(capsys):
   assert "env" in captured.out
   assert "check-tools" in captured.out
   assert "index" in captured.out
+  assert "extract-spec" in captured.out
+  assert "lookup-spec" in captured.out
 
 
 def test_env_missing_llvm_root_exits_nonzero(tmp_path, capsys):

@@ -5,6 +5,12 @@ import json
 import sys
 from pathlib import Path
 
+from dlc_testforge.extract_spec import (
+  build_spec_index,
+  load_spec_index,
+  lookup_dlc_spec,
+  write_spec_index,
+)
 from dlc_testforge.index import build_index, write_index
 from dlc_testforge.paths import discover_environment
 
@@ -61,6 +67,39 @@ def cmd_index(args: argparse.Namespace) -> int:
   return 0
 
 
+def cmd_extract_spec(args: argparse.Namespace) -> int:
+  try:
+    index = build_spec_index(args.llvm_root)
+    write_spec_index(index, args.out)
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  return 0
+
+
+def cmd_lookup_spec(args: argparse.Namespace) -> int:
+  try:
+    index = load_spec_index(args.index)
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  matches = lookup_dlc_spec(index, args.topic)
+  _print_json(
+    {
+      "topic": args.topic,
+      "match_count": len(matches),
+      "records": [record.to_dict() for record in matches],
+    }
+  )
+  return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="dlc-testforge",
@@ -91,6 +130,34 @@ def build_parser() -> argparse.ArgumentParser:
     help="Path to write the test index JSON.",
   )
   index_parser.set_defaults(func=cmd_index)
+
+  extract_spec_parser = subparsers.add_parser(
+    "extract-spec", help="Extract searchable records from DLC Markdown specs."
+  )
+  _add_llvm_root(extract_spec_parser)
+  extract_spec_parser.add_argument(
+    "--out",
+    required=True,
+    type=Path,
+    help="Path to write the DLC spec index JSON.",
+  )
+  extract_spec_parser.set_defaults(func=cmd_extract_spec)
+
+  lookup_spec_parser = subparsers.add_parser(
+    "lookup-spec", help="Search a DLC spec index JSON by topic."
+  )
+  lookup_spec_parser.add_argument(
+    "--index",
+    required=True,
+    type=Path,
+    help="Path to a DLC spec index JSON produced by extract-spec.",
+  )
+  lookup_spec_parser.add_argument(
+    "--topic",
+    required=True,
+    help="Case-insensitive topic substring to search for.",
+  )
+  lookup_spec_parser.set_defaults(func=cmd_lookup_spec)
 
   return parser
 

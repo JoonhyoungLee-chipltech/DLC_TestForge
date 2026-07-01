@@ -13,6 +13,8 @@ python3 -m dlc_testforge.cli --help
 python3 -m dlc_testforge.cli env --llvm-root /root/LLVM
 python3 -m dlc_testforge.cli check-tools --llvm-root /root/LLVM
 python3 -m dlc_testforge.cli index --llvm-root /root/LLVM --out /tmp/dlc-test-index.json
+python3 -m dlc_testforge.cli extract-spec --llvm-root /root/LLVM --out /tmp/dlc-spec-index.json
+python3 -m dlc_testforge.cli lookup-spec --index /tmp/dlc-spec-index.json --topic DMA
 ```
 
 Run tests with:
