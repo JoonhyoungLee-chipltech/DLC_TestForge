@@ -1,0 +1,41 @@
+name: machine_addropt
+description: Mutate tests around the DLC machine address optimization pass.
+source_files:
+  - llvm/lib/Target/DLC/DLCMachineAddrOpt.cpp
+spec_sources:
+  - docs/dlc_spec/instruction-format.md
+  - docs/dlc_spec/individual-instructions.md
+seed_selectors:
+  paths:
+    - llvm/test/CodeGen/DLC/machine-addropt-prera.ll
+  features:
+    - stop-after
+    - machine-pass
+commands:
+  base:
+    - "{llc} -mtriple=dlc -stop-after=dlc-machine-addropt {input} -o -"
+validation:
+  allow_verify_machineinstrs: false
+  required_levels:
+    - syntax
+    - command
+    - filecheck
+mutation_axes:
+  immediates:
+    enabled: true
+    values: [-256, -1, 0, 1, 2, 6, 7, 8, 15, 16, 31, 32, 63, 64, 255, 256, 257]
+  address_shapes:
+    enabled: true
+    values:
+      - shl_add_shra
+      - add_shift_reuse
+      - complex_add_shift
+  run_flags:
+    enabled: false
+bug_scout:
+  enabled: true
+  classify_crash: true
+  classify_assertion: true
+  classify_compile_failure: true
+notes:
+  - Do not enable global machine verifier for this profile.

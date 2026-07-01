@@ -1,0 +1,48 @@
+name: globalisel
+description: Mutate tests around DLC GlobalISel legalization and register-bank selection.
+source_files:
+  - llvm/lib/Target/DLC/GISel/DLCLegalizerInfo.cpp
+  - llvm/lib/Target/DLC/GISel/DLCRegisterBankInfo.cpp
+  - llvm/lib/Target/DLC/GISel/DLCInstructionSelector.cpp
+  - llvm/lib/Target/DLC/DLCInstrInfoGISel.td
+spec_sources:
+  - docs/dlc_spec/instruction-format.md
+  - docs/dlc_spec/individual-instructions.md
+seed_selectors:
+  paths:
+    - llvm/test/CodeGen/DLC/GIISel/legalizer.mir
+    - llvm/test/CodeGen/DLC/GIISel/regbankselect.mir
+    - llvm/test/CodeGen/DLC/GIISel/basic.ll
+  features:
+    - global-isel
+    - mir
+    - machine-pass
+commands:
+  base:
+    - "{llc} -global-isel -mtriple=dlc -filetype=asm {input} -o -"
+  variants:
+    - "{llc} -global-isel -mtriple=dlc -filetype=asm -run-pass=legalizer {input} -o -"
+    - "{llc} -global-isel -mtriple=dlc -filetype=asm -run-pass=regbankselect {input} -o -"
+validation:
+  allow_verify_machineinstrs: false
+  required_levels:
+    - syntax
+    - command
+    - filecheck
+mutation_axes:
+  scalar_types:
+    enabled: true
+    values: [s1, s8, s16, s32, s64]
+  generic_opcodes:
+    enabled: true
+    values: [G_ADD, G_SUB, G_MUL, G_TRUNC, G_ANYEXT, G_ZEXT, G_SEXT]
+  run_flags:
+    enabled: true
+    values: [legalizer, regbankselect]
+bug_scout:
+  enabled: true
+  classify_crash: true
+  classify_assertion: true
+  classify_compile_failure: true
+notes:
+  - Keep legalizer and regbankselect failures stage-local.

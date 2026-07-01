@@ -17,6 +17,7 @@ python3 -m dlc_testforge.cli index --llvm-root /root/LLVM --out /tmp/dlc-test-in
 python3 -m dlc_testforge.cli extract-spec --llvm-root /root/LLVM --out /tmp/dlc-spec-index.json
 python3 -m dlc_testforge.cli lookup-spec --index /tmp/dlc-spec-index.json --topic DMA
 python3 -m dlc_testforge.cli extract-td --llvm-root /root/LLVM --out /tmp/dlc-td-index.json
+python3 -m dlc_testforge.cli list-profiles --llvm-root /root/LLVM
 ```
 
 Run tests with:

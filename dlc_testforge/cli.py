@@ -14,6 +14,7 @@ from dlc_testforge.extract_spec import (
 )
 from dlc_testforge.index import build_index, write_index
 from dlc_testforge.paths import discover_environment
+from dlc_testforge.profiles import load_profiles, profile_summary
 
 
 def _add_llvm_root(parser: argparse.ArgumentParser) -> None:
@@ -114,6 +115,24 @@ def cmd_lookup_spec(args: argparse.Namespace) -> int:
   return 0
 
 
+def cmd_list_profiles(args: argparse.Namespace) -> int:
+  try:
+    profiles = load_profiles(args.profiles_dir)
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  _print_json(
+    {
+      "profile_count": len(profiles),
+      "profiles": [profile_summary(profile) for profile in profiles],
+    }
+  )
+  return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="dlc-testforge",
@@ -184,6 +203,18 @@ def build_parser() -> argparse.ArgumentParser:
     help="Case-insensitive topic substring to search for.",
   )
   lookup_spec_parser.set_defaults(func=cmd_lookup_spec)
+
+  list_profiles_parser = subparsers.add_parser(
+    "list-profiles", help="List available DLC mutation profiles."
+  )
+  _add_llvm_root(list_profiles_parser)
+  list_profiles_parser.add_argument(
+    "--profiles-dir",
+    type=Path,
+    default=None,
+    help="Optional directory of profile YAML files to load.",
+  )
+  list_profiles_parser.set_defaults(func=cmd_list_profiles)
 
   return parser
 
