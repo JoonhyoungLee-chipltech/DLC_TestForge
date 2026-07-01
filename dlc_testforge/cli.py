@@ -5,6 +5,11 @@ import json
 import sys
 from pathlib import Path
 
+from dlc_testforge.classify import (
+  classification_summary,
+  classify_validation,
+  write_classification,
+)
 from dlc_testforge.extract_td import build_td_index, write_td_index
 from dlc_testforge.extract_spec import (
   build_spec_index,
@@ -176,6 +181,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
   return 0 if report.overall_status != "fail" else 1
 
 
+def cmd_classify(args: argparse.Namespace) -> int:
+  try:
+    report = classify_validation(args.validation, profiles_dir=args.profiles_dir)
+    if args.out is not None:
+      write_classification(report, args.out)
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  _print_json(classification_summary(report))
+  return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="dlc-testforge",
@@ -332,6 +352,29 @@ def build_parser() -> argparse.ArgumentParser:
     help="Per-command timeout in seconds.",
   )
   validate_parser.set_defaults(func=cmd_validate)
+
+  classify_parser = subparsers.add_parser(
+    "classify", help="Classify one validation status JSON file."
+  )
+  classify_parser.add_argument(
+    "--validation",
+    required=True,
+    type=Path,
+    help="Path to a validation status.json file.",
+  )
+  classify_parser.add_argument(
+    "--profiles-dir",
+    type=Path,
+    default=None,
+    help="Optional directory of profile YAML files to load.",
+  )
+  classify_parser.add_argument(
+    "--out",
+    type=Path,
+    default=None,
+    help="Optional path to write full classification JSON.",
+  )
+  classify_parser.set_defaults(func=cmd_classify)
 
   return parser
 
