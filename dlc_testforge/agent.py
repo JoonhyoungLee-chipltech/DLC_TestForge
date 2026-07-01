@@ -1,0 +1,511 @@
+from __future__ import annotations
+
+import json
+import os
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from dlc_testforge.profiles import MutationProfile
+
+
+DEFAULT_ENDPOINT = "https://api.openai.com/v1"
+PLACEHOLDER_VALUES = {"", "sk-", "Please fill out"}
+CODEX_AUTH_PATH = Path("/root/.codex/auth.json")
+CODEX_CONFIG_PATH = Path("/root/.codex/config.toml")
+
+
+@dataclass(frozen=True)
+class AgentMutationProposal:
+  axis: str
+  location_hint: str
+  old_value: int
+  new_value: int
+  rationale: str
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "axis": self.axis,
+      "location_hint": self.location_hint,
+      "old_value": self.old_value,
+      "new_value": self.new_value,
+      "rationale": self.rationale,
+    }
+
+
+@dataclass(frozen=True)
+class AgentProposal:
+  seed: str
+  profile: str
+  proposed_mutations: list[AgentMutationProposal]
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "seed": self.seed,
+      "profile": self.profile,
+      "proposed_mutations": [
+        mutation.to_dict() for mutation in self.proposed_mutations
+      ],
+    }
+
+
+@dataclass(frozen=True)
+class RejectedAgentMutation:
+  index: int
+  mutation: dict[str, Any]
+  reason: str
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "index": self.index,
+      "mutation": self.mutation,
+      "reason": self.reason,
+    }
+
+
+def build_agent_context(
+  profile: MutationProfile,
+  seed_relative: str,
+  seed_text: str,
+  max_candidates: int,
+  *,
+  test_index: dict[str, Any] | None = None,
+  spec_index: dict[str, Any] | None = None,
+  td_index: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+  seed_record = _find_seed_record(test_index, seed_relative)
+  return {
+    "task": "propose_dlc_test_mutations",
+    "contract": {
+      "role": "propose mutation ideas only",
+      "output_format": "json",
+      "required_top_level_fields": [
+        "seed",
+        "profile",
+        "proposed_mutations",
+      ],
+      "required_mutation_fields": [
+        "axis",
+        "location_hint",
+        "old_value",
+        "new_value",
+        "rationale",
+      ],
+    },
+    "seed": {
+      "path": seed_relative,
+      "text": seed_text,
+      "index_record": seed_record,
+    },
+    "profile": profile.to_dict(),
+    "spec_records": _select_spec_records(spec_index, profile.spec_sources),
+    "source_records": _select_source_records(td_index, profile.source_files),
+    "td_summary": (td_index or {}).get("summary", {}),
+    "mutation_budget": max_candidates,
+    "guardrails": [
+      "Use the exact seed and profile from this context.",
+      "Only propose immediate-value mutations supported by profile.mutation_axes.immediates.values.",
+      "Do not change RUN lines.",
+      "Do not invent DLC instructions or intrinsics.",
+      "Each proposed mutation must change one old_value to one new_value.",
+    ],
+  }
+
+
+def load_agent_proposal(path: Path) -> AgentProposal:
+  text = path.expanduser().read_text(encoding="utf-8")
+  return parse_agent_proposal(text)
+
+
+def request_agent_proposal(
+  context: dict[str, Any],
+  *,
+  model: str | None = None,
+  endpoint: str | None = None,
+  api_key: str | None = None,
+) -> AgentProposal:
+  resolved_model = _first_config_value(
+    model,
+    os.environ.get("DLC_TESTFORGE_LM_MODEL"),
+    os.environ.get("LLVM_HARNESS_LM_MODEL"),
+    _load_codex_config().get("model"),
+  )
+  if not resolved_model:
+    raise ValueError(
+      "agent mode requires --agent-model, DLC_TESTFORGE_LM_MODEL, or "
+      "LLVM_HARNESS_LM_MODEL when no --agent-proposal is provided"
+    )
+
+  resolved_api_key = _first_config_value(
+    api_key,
+    os.environ.get("DLC_TESTFORGE_LM_API_KEY"),
+    os.environ.get("LLVM_HARNESS_LM_API_KEY"),
+    _load_codex_auth().get("OPENAI_API_KEY"),
+  )
+  if not resolved_api_key:
+    raise ValueError(
+      "agent mode requires DLC_TESTFORGE_LM_API_KEY or LLVM_HARNESS_LM_API_KEY "
+      "when no --agent-proposal is provided"
+    )
+
+  resolved_endpoint = _first_config_value(
+    endpoint,
+    os.environ.get("DLC_TESTFORGE_LM_API_ENDPOINT"),
+    os.environ.get("LLVM_HARNESS_LM_API_ENDPOINT"),
+    _load_codex_config().get("provider.base_url"),
+    DEFAULT_ENDPOINT,
+  ).rstrip("/")
+  resolved_model = _migrate_codex_model(resolved_model)
+  payload = {
+    "model": resolved_model,
+    "temperature": 0,
+    "messages": [
+      {
+        "role": "system",
+        "content": (
+          "You propose DLC LLVM test mutations. Return only one JSON object. "
+          "Do not include Markdown fences, prose, comments, or extra top-level keys. "
+          "The object must have exactly these top-level fields: seed, profile, "
+          "proposed_mutations. The seed and profile fields must be strings."
+        ),
+      },
+      {
+        "role": "user",
+        "content": "\n".join(
+          [
+            "Use this context to propose mutations:",
+            json.dumps(context, indent=2, sort_keys=True),
+            "",
+            "Return this exact JSON shape:",
+            json.dumps(
+              {
+                "seed": context.get("seed", {}).get("path", ""),
+                "profile": context.get("profile", {}).get("name", ""),
+                "proposed_mutations": [
+                  {
+                    "axis": "shift_amount_boundary",
+                    "location_hint": "function or line hint",
+                    "old_value": 7,
+                    "new_value": 6,
+                    "rationale": "why this edge case is worth trying",
+                  }
+                ],
+              },
+              indent=2,
+              sort_keys=True,
+            ),
+            "Use an empty proposed_mutations list if no valid mutation is supported.",
+          ]
+        ),
+      },
+    ],
+  }
+  request = urllib.request.Request(
+    f"{resolved_endpoint}/chat/completions",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={
+      "Authorization": f"Bearer {resolved_api_key}",
+      "Content-Type": "application/json",
+    },
+    method="POST",
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=120) as response:
+      response_data = json.loads(response.read().decode("utf-8"))
+  except urllib.error.URLError as exc:
+    raise ValueError(f"agent request failed: {exc}") from exc
+
+  try:
+    content = response_data["choices"][0]["message"]["content"]
+  except (KeyError, IndexError, TypeError) as exc:
+    raise ValueError("agent response did not contain choices[0].message.content") from exc
+  return parse_agent_proposal(content)
+
+
+def parse_agent_proposal(text: str) -> AgentProposal:
+  data = _loads_json_object(text)
+  if not isinstance(data, dict):
+    raise ValueError("agent proposal must be a JSON object")
+
+  seed = data.get("seed")
+  profile = data.get("profile")
+  proposed = data.get("proposed_mutations")
+  if not isinstance(seed, str) or not seed:
+    raise ValueError("agent proposal field seed must be a non-empty string")
+  if not isinstance(profile, str) or not profile:
+    raise ValueError("agent proposal field profile must be a non-empty string")
+  if not isinstance(proposed, list):
+    raise ValueError("agent proposal field proposed_mutations must be a list")
+
+  mutations = []
+  for index, item in enumerate(proposed):
+    mutations.append(_parse_mutation(index, item))
+  return AgentProposal(seed=seed, profile=profile, proposed_mutations=mutations)
+
+
+def filter_agent_mutations(
+  proposal: AgentProposal,
+  profile: MutationProfile,
+  seed_relative: str,
+  max_candidates: int,
+) -> tuple[list[AgentMutationProposal], list[RejectedAgentMutation]]:
+  if proposal.seed != seed_relative:
+    raise ValueError(
+      f"agent proposal seed {proposal.seed} does not match requested seed {seed_relative}"
+    )
+  if proposal.profile != profile.name:
+    raise ValueError(
+      f"agent proposal profile {proposal.profile} does not match requested profile {profile.name}"
+    )
+
+  accepted: list[AgentMutationProposal] = []
+  rejected: list[RejectedAgentMutation] = []
+  allowed_values = _allowed_immediate_values(profile)
+  if not allowed_values:
+    for index, mutation in enumerate(proposal.proposed_mutations):
+      rejected.append(
+        RejectedAgentMutation(
+          index=index,
+          mutation=mutation.to_dict(),
+          reason="profile does not enable integer immediate mutation values",
+        )
+      )
+    return accepted, rejected
+
+  for index, mutation in enumerate(proposal.proposed_mutations):
+    reason = _rejection_reason(mutation, allowed_values)
+    if reason is not None:
+      rejected.append(
+        RejectedAgentMutation(
+          index=index,
+          mutation=mutation.to_dict(),
+          reason=reason,
+        )
+      )
+      continue
+    if len(accepted) >= max_candidates:
+      rejected.append(
+        RejectedAgentMutation(
+          index=index,
+          mutation=mutation.to_dict(),
+          reason="mutation budget exhausted",
+        )
+      )
+      continue
+    accepted.append(mutation)
+  return accepted, rejected
+
+
+def write_agent_json(path: Path, data: Any) -> None:
+  path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _first_config_value(*values: str | None) -> str | None:
+  for value in values:
+    if value is None:
+      continue
+    stripped = value.strip()
+    if stripped in PLACEHOLDER_VALUES:
+      continue
+    return stripped
+  return None
+
+
+def _load_codex_auth() -> dict[str, str]:
+  if not CODEX_AUTH_PATH.is_file():
+    return {}
+  try:
+    data = json.loads(CODEX_AUTH_PATH.read_text(encoding="utf-8"))
+  except (OSError, json.JSONDecodeError):
+    return {}
+  return data if isinstance(data, dict) else {}
+
+
+def _load_codex_config() -> dict[str, str]:
+  if not CODEX_CONFIG_PATH.is_file():
+    return {}
+  try:
+    text = CODEX_CONFIG_PATH.read_text(encoding="utf-8")
+  except OSError:
+    return {}
+
+  root: dict[str, str] = {}
+  for raw_line in text.splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or line.startswith("[") or "=" not in line:
+      continue
+    key, value = _parse_toml_assignment(line)
+    if key:
+      root[key] = value
+
+  provider_name = root.get("model_provider", "")
+  provider_cfg = _parse_toml_table(text, f"model_providers.{provider_name}")
+  migrations = _parse_toml_table(text, "notice.model_migrations")
+
+  merged = dict(root)
+  for key, value in provider_cfg.items():
+    merged[f"provider.{key}"] = value
+  for key, value in migrations.items():
+    merged[f"migration.{key}"] = value
+  return merged
+
+
+def _parse_toml_table(text: str, table_name: str) -> dict[str, str]:
+  current = None
+  data: dict[str, str] = {}
+  for raw_line in text.splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+      continue
+    if line.startswith("[") and line.endswith("]"):
+      current = line[1:-1].strip()
+      continue
+    if current != table_name or "=" not in line:
+      continue
+    key, value = _parse_toml_assignment(line)
+    if key:
+      data[key] = value
+  return data
+
+
+def _parse_toml_assignment(line: str) -> tuple[str, str]:
+  key, value = line.split("=", 1)
+  key = key.strip()
+  value = value.strip()
+  if key.startswith('"') and key.endswith('"'):
+    key = key[1:-1]
+  if value.startswith('"') and value.endswith('"'):
+    value = value[1:-1]
+  return key, value
+
+
+def _migrate_codex_model(model: str) -> str:
+  config = _load_codex_config()
+  migrated = config.get(f"migration.{model}")
+  if migrated:
+    return migrated
+  if config.get("model_provider") == "openrouter" and "/" not in model:
+    if model.startswith("gpt-"):
+      return f"openai/{model}"
+  return model
+
+
+def _loads_json_object(text: str) -> Any:
+  stripped = text.strip()
+  if stripped.startswith("```"):
+    lines = stripped.splitlines()
+    if len(lines) >= 3 and lines[-1].strip() == "```":
+      stripped = "\n".join(lines[1:-1]).strip()
+      if stripped.startswith("json\n"):
+        stripped = stripped[len("json\n") :].strip()
+  try:
+    return json.loads(stripped)
+  except json.JSONDecodeError:
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end < start:
+      raise
+    return json.loads(stripped[start : end + 1])
+
+
+def _parse_mutation(index: int, item: Any) -> AgentMutationProposal:
+  if not isinstance(item, dict):
+    raise ValueError(f"proposed_mutations[{index}] must be a JSON object")
+  axis = item.get("axis")
+  location_hint = item.get("location_hint")
+  old_value = item.get("old_value")
+  new_value = item.get("new_value")
+  rationale = item.get("rationale")
+  if not isinstance(axis, str) or not axis:
+    raise ValueError(f"proposed_mutations[{index}].axis must be a non-empty string")
+  if not isinstance(location_hint, str):
+    raise ValueError(f"proposed_mutations[{index}].location_hint must be a string")
+  if not isinstance(old_value, int) or isinstance(old_value, bool):
+    raise ValueError(f"proposed_mutations[{index}].old_value must be an integer")
+  if not isinstance(new_value, int) or isinstance(new_value, bool):
+    raise ValueError(f"proposed_mutations[{index}].new_value must be an integer")
+  if not isinstance(rationale, str) or not rationale:
+    raise ValueError(f"proposed_mutations[{index}].rationale must be a non-empty string")
+  return AgentMutationProposal(
+    axis=axis,
+    location_hint=location_hint,
+    old_value=old_value,
+    new_value=new_value,
+    rationale=rationale,
+  )
+
+
+def _allowed_immediate_values(profile: MutationProfile) -> set[int]:
+  axis = profile.mutation_axes.get("immediates", {})
+  if not isinstance(axis, dict) or not axis.get("enabled", False):
+    return set()
+  values = axis.get("values", [])
+  if not isinstance(values, list):
+    return set()
+  return {value for value in values if isinstance(value, int) and not isinstance(value, bool)}
+
+
+def _rejection_reason(
+  mutation: AgentMutationProposal, allowed_values: set[int]
+) -> str | None:
+  if mutation.axis not in {
+    "immediates",
+    "immediate_boundary",
+    "shift_amount_boundary",
+  }:
+    return f"unsupported mutation axis for current agent generator: {mutation.axis}"
+  if mutation.old_value == mutation.new_value:
+    return "old_value and new_value are identical"
+  if mutation.new_value not in allowed_values:
+    return f"new_value {mutation.new_value} is not allowed by profile immediates.values"
+  return None
+
+
+def _find_seed_record(
+  test_index: dict[str, Any] | None, seed_relative: str
+) -> dict[str, Any] | None:
+  for record in (test_index or {}).get("tests", []):
+    if isinstance(record, dict) and record.get("path") == seed_relative:
+      return record
+  return None
+
+
+def _select_spec_records(
+  spec_index: dict[str, Any] | None, spec_sources: list[str]
+) -> list[dict[str, Any]]:
+  records = []
+  wanted_sources = set(spec_sources)
+  for record in (spec_index or {}).get("records", []):
+    if not isinstance(record, dict):
+      continue
+    if wanted_sources and record.get("source") not in wanted_sources:
+      continue
+    records.append(record)
+    if len(records) >= 20:
+      break
+  return records
+
+
+def _select_source_records(
+  td_index: dict[str, Any] | None, source_files: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+  wanted_sources = set(source_files)
+  result: dict[str, list[dict[str, Any]]] = {
+    "intrinsics": [],
+    "builtins": [],
+    "instructions": [],
+    "references": [],
+  }
+  for key in result:
+    for record in (td_index or {}).get(key, []):
+      if not isinstance(record, dict):
+        continue
+      source = record.get("source")
+      if wanted_sources and source not in wanted_sources:
+        continue
+      result[key].append(record)
+      if len(result[key]) >= 20:
+        break
+  return result

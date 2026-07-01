@@ -8,6 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dlc_testforge.agent import (
+  AgentMutationProposal,
+  build_agent_context,
+  filter_agent_mutations,
+  load_agent_proposal,
+  request_agent_proposal,
+  write_agent_json,
+)
 from dlc_testforge.extract_spec import build_spec_index, write_spec_index
 from dlc_testforge.extract_td import build_td_index, write_td_index
 from dlc_testforge.index import build_index, write_index
@@ -28,9 +36,10 @@ class CandidateRecord:
   new_value: int
   line: int
   comment: str
+  rationale: str | None = None
 
   def to_dict(self) -> dict[str, Any]:
-    return {
+    data = {
       "path": self.path,
       "seed": self.seed,
       "profile": self.profile,
@@ -40,6 +49,9 @@ class CandidateRecord:
       "line": self.line,
       "comment": self.comment,
     }
+    if self.rationale is not None:
+      data["rationale"] = self.rationale
+    return data
 
 
 @dataclass(frozen=True)
@@ -85,9 +97,15 @@ def create_workspace(
   dry_run: bool,
   profiles_dir: Path | None = None,
   max_candidates: int = 10,
+  mode: str = "manual",
+  agent_proposal: Path | None = None,
+  agent_model: str | None = None,
+  agent_endpoint: str | None = None,
 ) -> WorkspaceManifest:
   if max_candidates < 1:
     raise ValueError("max-candidates must be at least 1")
+  if mode not in {"manual", "agent"}:
+    raise ValueError("mode must be one of: manual, agent")
 
   llvm_root = llvm_root.expanduser().resolve(strict=False)
   out_dir = out_dir.expanduser().resolve(strict=False)
@@ -119,21 +137,66 @@ def create_workspace(
     raise ValueError(f"profile {profile.name} has no source path")
   shutil.copyfile(profile.path, profile_input_path)
 
-  write_index(build_index(llvm_root), inputs_dir / "test-index.json")
-  write_spec_index(build_spec_index(llvm_root), inputs_dir / "spec-index.json")
-  write_td_index(build_td_index(llvm_root), inputs_dir / "td-index.json")
+  test_index = build_index(llvm_root)
+  spec_index = build_spec_index(llvm_root)
+  td_index = build_td_index(llvm_root)
+  write_index(test_index, inputs_dir / "test-index.json")
+  write_spec_index(spec_index, inputs_dir / "spec-index.json")
+  write_td_index(td_index, inputs_dir / "td-index.json")
 
   candidates = []
-  if not dry_run:
-    seed_text = seed_path.read_text(encoding="utf-8")
-    candidates = _generate_candidates(
-      seed_text,
+  seed_text = seed_path.read_text(encoding="utf-8")
+  if mode == "agent":
+    context = build_agent_context(
+      profile,
       seed_relative,
-      profile.name,
-      profile.mutation_axes,
-      candidates_dir,
+      seed_text,
       max_candidates,
+      test_index=test_index.to_dict(),
+      spec_index=spec_index.to_dict(),
+      td_index=td_index.to_dict(),
     )
+    write_agent_json(inputs_dir / "agent-context.json", context)
+
+  if not dry_run:
+    if mode == "manual":
+      candidates = _generate_candidates(
+        seed_text,
+        seed_relative,
+        profile.name,
+        profile.mutation_axes,
+        candidates_dir,
+        max_candidates,
+      )
+    else:
+      if agent_proposal is not None:
+        proposal = load_agent_proposal(agent_proposal)
+      else:
+        proposal = request_agent_proposal(
+          context,
+          model=agent_model,
+          endpoint=agent_endpoint,
+        )
+      write_agent_json(inputs_dir / "agent-proposal.json", proposal.to_dict())
+      accepted, rejected = filter_agent_mutations(
+        proposal, profile, seed_relative, max_candidates
+      )
+      candidates, application_rejections = _generate_agent_candidates(
+        seed_text,
+        seed_relative,
+        profile.name,
+        accepted,
+        candidates_dir,
+      )
+      write_agent_json(
+        results_dir / "agent-rejections.json",
+        {
+          "rejection_count": len(rejected) + len(application_rejections),
+          "rejections": [
+            entry.to_dict() for entry in rejected
+          ] + application_rejections,
+        },
+      )
 
   created_at = datetime.now(timezone.utc).replace(microsecond=0)
   manifest = WorkspaceManifest(
@@ -142,7 +205,7 @@ def create_workspace(
     llvm_root=llvm_root,
     profile=profile.name,
     seed=seed_relative,
-    mode="manual",
+    mode=mode,
     dry_run=dry_run,
     created_at=created_at.isoformat().replace("+00:00", "Z"),
     tool_version=TOOL_VERSION,
@@ -153,6 +216,12 @@ def create_workspace(
       "test_index": "inputs/test-index.json",
       "spec_index": "inputs/spec-index.json",
       "td_index": "inputs/td-index.json",
+      **({"agent_context": "inputs/agent-context.json"} if mode == "agent" else {}),
+      **(
+        {"agent_proposal": "inputs/agent-proposal.json"}
+        if mode == "agent" and not dry_run
+        else {}
+      ),
     },
     candidate_count=len(candidates),
     candidates=candidates,
@@ -241,6 +310,99 @@ def _generate_candidates(
           return candidates
 
   return candidates
+
+
+def _generate_agent_candidates(
+  seed_text: str,
+  seed_relative: str,
+  profile_name: str,
+  proposals: list[AgentMutationProposal],
+  candidates_dir: Path,
+) -> tuple[list[CandidateRecord], list[dict[str, Any]]]:
+  if not seed_relative.endswith(".ll"):
+    return [], [
+      {
+        "index": index,
+        "mutation": proposal.to_dict(),
+        "reason": "current agent generator only supports .ll seeds",
+      }
+      for index, proposal in enumerate(proposals)
+    ]
+
+  lines = seed_text.splitlines(keepends=True)
+  candidates: list[CandidateRecord] = []
+  rejections: list[dict[str, Any]] = []
+  used_locations: set[tuple[int, int, int]] = set()
+  for index, proposal in enumerate(proposals):
+    match = _find_agent_mutation_location(lines, proposal, used_locations)
+    if match is None:
+      rejections.append(
+        {
+          "index": index,
+          "mutation": proposal.to_dict(),
+          "reason": "old_value was not found on a mutable seed line for the requested axis",
+        }
+      )
+      continue
+    line_index, start, end = match
+    used_locations.add((line_index, start, end))
+    candidate_number = len(candidates) + 1
+    filename = f"candidate-{candidate_number:04d}.ll"
+    comment = (
+      f"; DLC-MUTATION: profile={profile_name} mode=agent axis={proposal.axis} "
+      f"source_value={proposal.old_value} new_value={proposal.new_value}"
+    )
+    candidate_lines = list(lines)
+    line = lines[line_index]
+    candidate_lines[line_index] = (
+      f"{comment}\n"
+      f"{line[:start]}{proposal.new_value}{line[end:]}"
+    )
+    candidate_path = candidates_dir / filename
+    candidate_path.write_text("".join(candidate_lines), encoding="utf-8")
+    candidates.append(
+      CandidateRecord(
+        path=f"candidates/{filename}",
+        seed=seed_relative,
+        profile=profile_name,
+        mutation_axis=proposal.axis,
+        source_value=proposal.old_value,
+        new_value=proposal.new_value,
+        line=line_index + 1,
+        comment=comment,
+        rationale=proposal.rationale,
+      )
+    )
+  return candidates, rejections
+
+
+def _find_agent_mutation_location(
+  lines: list[str],
+  proposal: AgentMutationProposal,
+  used_locations: set[tuple[int, int, int]],
+) -> tuple[int, int, int] | None:
+  for line_index, line in enumerate(lines):
+    if not _is_mutable_ir_line(line):
+      continue
+    if not _agent_axis_matches_line(proposal.axis, line):
+      continue
+    for match in INTEGER_RE.finditer(line):
+      if int(match.group(0)) != proposal.old_value:
+        continue
+      location = (line_index, match.start(), match.end())
+      if location in used_locations:
+        continue
+      return location
+  return None
+
+
+def _agent_axis_matches_line(axis: str, line: str) -> bool:
+  line_axis = _axis_for_line(line)
+  if axis == "immediates":
+    return True
+  if axis == "immediate_boundary":
+    return line_axis == "immediate_boundary"
+  return axis == line_axis
 
 
 def _is_mutable_ir_line(line: str) -> bool:

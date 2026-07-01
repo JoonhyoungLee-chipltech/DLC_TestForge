@@ -152,6 +152,10 @@ def cmd_generate(args: argparse.Namespace) -> int:
       dry_run=args.dry_run,
       profiles_dir=args.profiles_dir,
       max_candidates=args.max_candidates,
+      mode=args.mode,
+      agent_proposal=args.agent_proposal,
+      agent_model=args.agent_model,
+      agent_endpoint=args.agent_endpoint,
     )
   except OSError as exc:
     print(f"error: {exc}", file=sys.stderr)
@@ -352,6 +356,28 @@ def build_parser() -> argparse.ArgumentParser:
     type=int,
     default=10,
     help="Maximum number of mutation candidates to write.",
+  )
+  generate_parser.add_argument(
+    "--mode",
+    choices=["manual", "agent"],
+    default="manual",
+    help="Generation mode. Agent mode asks for structured mutation proposals before writing candidates.",
+  )
+  generate_parser.add_argument(
+    "--agent-proposal",
+    type=Path,
+    default=None,
+    help="Optional JSON proposal file for agent mode. Skips the LLM request.",
+  )
+  generate_parser.add_argument(
+    "--agent-model",
+    default=None,
+    help="LLM model for agent mode when --agent-proposal is not provided.",
+  )
+  generate_parser.add_argument(
+    "--agent-endpoint",
+    default=None,
+    help="OpenAI-compatible API endpoint for agent mode.",
   )
   generate_parser.set_defaults(func=cmd_generate)
 

@@ -367,6 +367,157 @@ def test_cli_generate_non_dry_run_outputs_json(tmp_path, capsys):
   assert (out_dir / "candidates" / "candidate-0001.ll").is_file()
 
 
+def test_agent_mode_uses_proposal_file_and_records_rejections(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  proposal_path = tmp_path / "proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "proposed_mutations": [
+          {
+            "axis": "shift_amount_boundary",
+            "location_hint": "example",
+            "old_value": 7,
+            "new_value": 6,
+            "rationale": "exercise the adjacent lower shift boundary",
+          },
+          {
+            "axis": "shift_amount_boundary",
+            "location_hint": "example",
+            "old_value": 99,
+            "new_value": 1,
+            "rationale": "cannot be applied because old value is absent",
+          },
+          {
+            "axis": "address_shapes",
+            "location_hint": "example",
+            "old_value": 7,
+            "new_value": 1,
+            "rationale": "unsupported by current agent generator",
+          },
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace",
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    max_candidates=3,
+    mode="agent",
+    agent_proposal=proposal_path,
+  )
+
+  assert manifest.mode == "agent"
+  assert manifest.candidate_count == 1
+  assert manifest.inputs["agent_context"] == "inputs/agent-context.json"
+  assert manifest.inputs["agent_proposal"] == "inputs/agent-proposal.json"
+  candidate_text = (tmp_path / "workspace" / "candidates" / "candidate-0001.ll").read_text(
+    encoding="utf-8"
+  )
+  assert "mode=agent axis=shift_amount_boundary source_value=7 new_value=6" in candidate_text
+  assert "%shl = shl i32 %x, 6" in candidate_text
+  assert manifest.candidates[0].rationale == "exercise the adjacent lower shift boundary"
+
+  rejections = json.loads(
+    (tmp_path / "workspace" / "results" / "agent-rejections.json").read_text(
+      encoding="utf-8"
+    )
+  )
+  assert rejections["rejection_count"] == 2
+  assert [entry["reason"] for entry in rejections["rejections"]] == [
+    "unsupported mutation axis for current agent generator: address_shapes",
+    "old_value was not found on a mutable seed line for the requested axis",
+  ]
+
+
+def test_cli_generate_agent_mode_outputs_json(tmp_path, capsys):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  out_dir = tmp_path / "workspace"
+  proposal_path = tmp_path / "proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "proposed_mutations": [
+          {
+            "axis": "immediates",
+            "location_hint": "example",
+            "old_value": 5,
+            "new_value": 1,
+            "rationale": "exercise small add immediate",
+          }
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  assert (
+    main(
+      [
+        "generate",
+        "--llvm-root",
+        str(llvm_root),
+        "--profile",
+        "example",
+        "--seed",
+        "llvm/test/CodeGen/DLC/example.ll",
+        "--out-dir",
+        str(out_dir),
+        "--profiles-dir",
+        str(profiles_dir),
+        "--mode",
+        "agent",
+        "--agent-proposal",
+        str(proposal_path),
+      ]
+    )
+    == 0
+  )
+
+  captured = capsys.readouterr()
+  result = json.loads(captured.out)
+  assert result["status"] == "generated"
+  assert result["candidate_count"] == 1
+  assert (out_dir / "inputs" / "agent-context.json").is_file()
+  assert (out_dir / "results" / "agent-rejections.json").is_file()
+
+
+def test_agent_mode_without_proposal_requires_model(tmp_path, monkeypatch):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  monkeypatch.setattr("dlc_testforge.agent.CODEX_AUTH_PATH", tmp_path / "missing-auth.json")
+  monkeypatch.setattr(
+    "dlc_testforge.agent.CODEX_CONFIG_PATH", tmp_path / "missing-config.toml"
+  )
+
+  try:
+    create_workspace(
+      llvm_root,
+      "example",
+      "llvm/test/CodeGen/DLC/example.ll",
+      tmp_path / "workspace",
+      dry_run=False,
+      profiles_dir=profiles_dir,
+      mode="agent",
+    )
+  except ValueError as exc:
+    assert "requires --agent-model" in str(exc)
+  else:
+    raise AssertionError("expected ValueError")
+
+
 def _make_profile_text(name, seed):
   return f"""name: {name}
 description: Example generation profile.
