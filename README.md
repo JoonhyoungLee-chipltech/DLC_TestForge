@@ -18,6 +18,7 @@ python3 -m dlc_testforge.cli extract-spec --llvm-root /root/LLVM --out /tmp/dlc-
 python3 -m dlc_testforge.cli lookup-spec --index /tmp/dlc-spec-index.json --topic DMA
 python3 -m dlc_testforge.cli extract-td --llvm-root /root/LLVM --out /tmp/dlc-td-index.json
 python3 -m dlc_testforge.cli list-profiles --llvm-root /root/LLVM
+python3 -m dlc_testforge.cli generate --llvm-root /root/LLVM --profile machine_addropt --seed llvm/test/CodeGen/DLC/machine-addropt-prera.ll --out-dir /tmp/dlc-mutation-run --dry-run
 ```
 
 Run tests with:

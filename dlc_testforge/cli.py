@@ -13,6 +13,7 @@ from dlc_testforge.extract_spec import (
   write_spec_index,
 )
 from dlc_testforge.index import build_index, write_index
+from dlc_testforge.generate import create_workspace, generation_summary
 from dlc_testforge.paths import discover_environment
 from dlc_testforge.profiles import load_profiles, profile_summary
 
@@ -133,6 +134,26 @@ def cmd_list_profiles(args: argparse.Namespace) -> int:
   return 0
 
 
+def cmd_generate(args: argparse.Namespace) -> int:
+  try:
+    manifest = create_workspace(
+      args.llvm_root,
+      args.profile,
+      args.seed,
+      args.out_dir,
+      dry_run=args.dry_run,
+      profiles_dir=args.profiles_dir,
+    )
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  _print_json(generation_summary(manifest))
+  return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="dlc-testforge",
@@ -215,6 +236,39 @@ def build_parser() -> argparse.ArgumentParser:
     help="Optional directory of profile YAML files to load.",
   )
   list_profiles_parser.set_defaults(func=cmd_list_profiles)
+
+  generate_parser = subparsers.add_parser(
+    "generate", help="Create a DLC mutation workspace."
+  )
+  _add_llvm_root(generate_parser)
+  generate_parser.add_argument(
+    "--profile",
+    required=True,
+    help="Profile name to use.",
+  )
+  generate_parser.add_argument(
+    "--seed",
+    required=True,
+    help="LLVM-root-relative seed test path.",
+  )
+  generate_parser.add_argument(
+    "--out-dir",
+    required=True,
+    type=Path,
+    help="Workspace directory to create.",
+  )
+  generate_parser.add_argument(
+    "--profiles-dir",
+    type=Path,
+    default=None,
+    help="Optional directory of profile YAML files to load.",
+  )
+  generate_parser.add_argument(
+    "--dry-run",
+    action="store_true",
+    help="Create workspace inputs but do not write candidate files.",
+  )
+  generate_parser.set_defaults(func=cmd_generate)
 
   return parser
 
