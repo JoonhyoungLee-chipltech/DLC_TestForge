@@ -144,6 +144,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
       args.out_dir,
       dry_run=args.dry_run,
       profiles_dir=args.profiles_dir,
+      max_candidates=args.max_candidates,
     )
   except OSError as exc:
     print(f"error: {exc}", file=sys.stderr)
@@ -288,6 +289,12 @@ def build_parser() -> argparse.ArgumentParser:
     "--dry-run",
     action="store_true",
     help="Create workspace inputs but do not write candidate files.",
+  )
+  generate_parser.add_argument(
+    "--max-candidates",
+    type=int,
+    default=10,
+    help="Maximum number of mutation candidates to write.",
   )
   generate_parser.set_defaults(func=cmd_generate)
 

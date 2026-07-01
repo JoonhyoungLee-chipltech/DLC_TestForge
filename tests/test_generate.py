@@ -17,9 +17,11 @@ def _make_llvm_root(tmp_path):
     llvm_root / "llvm" / "test" / "CodeGen" / "DLC" / "example.ll",
     """; RUN: llc -mtriple=dlc < %s | FileCheck %s
 define i32 @example(i32 %x) {
-  ret i32 %x
+  %shl = shl i32 %x, 7
+  %add = add i32 %shl, 5
+  ret i32 %add
 }
-; CHECK: example
+; CHECK: S_ADD %{{[0-9]+}}, 5
 """,
   )
   (llvm_root / "docs" / "dlc_spec").mkdir(parents=True)
@@ -48,7 +50,7 @@ validation:
 mutation_axes:
   immediates:
     enabled: true
-    values: [0, 1]
+    values: [0, 1, 6]
 bug_scout:
   enabled: true
   classify_crash: true
@@ -182,7 +184,76 @@ def test_non_empty_output_directory_fails(tmp_path):
     raise AssertionError("expected ValueError")
 
 
-def test_non_dry_run_fails(tmp_path):
+def test_non_dry_run_generates_deterministic_candidates(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  out_dir = tmp_path / "workspace"
+  seed_path = llvm_root / "llvm" / "test" / "CodeGen" / "DLC" / "example.ll"
+  original_seed = seed_path.read_text(encoding="utf-8")
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    out_dir,
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    max_candidates=3,
+  )
+
+  assert manifest.dry_run is False
+  assert manifest.candidate_count == 3
+  assert [candidate.path for candidate in manifest.candidates] == [
+    "candidates/candidate-0001.ll",
+    "candidates/candidate-0002.ll",
+    "candidates/candidate-0003.ll",
+  ]
+  assert [candidate.new_value for candidate in manifest.candidates] == [0, 1, 6]
+  assert [candidate.mutation_axis for candidate in manifest.candidates] == [
+    "shift_amount_boundary",
+    "shift_amount_boundary",
+    "shift_amount_boundary",
+  ]
+  candidate_text = (out_dir / "candidates" / "candidate-0001.ll").read_text(
+    encoding="utf-8"
+  )
+  assert candidate_text.count("DLC-MUTATION:") == 1
+  assert "source_value=7 new_value=0" in candidate_text
+  assert "%shl = shl i32 %x, 0" in candidate_text
+  assert "; RUN: llc -mtriple=dlc < %s | FileCheck %s" in candidate_text
+  assert "; CHECK: S_ADD %{{[0-9]+}}, 5" in candidate_text
+  assert seed_path.read_text(encoding="utf-8") == original_seed
+
+  manifest_json = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+  assert manifest_json["dry_run"] is False
+  assert manifest_json["candidate_count"] == 3
+  assert manifest_json["candidates"] == [
+    candidate.to_dict() for candidate in manifest.candidates
+  ]
+
+
+def test_non_dry_run_respects_max_candidates(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace",
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    max_candidates=1,
+  )
+
+  assert manifest.candidate_count == 1
+  candidate_names = sorted(
+    path.name for path in (tmp_path / "workspace" / "candidates").iterdir()
+  )
+  assert candidate_names == ["candidate-0001.ll"]
+
+
+def test_invalid_max_candidates_fails(tmp_path):
   llvm_root = _make_llvm_root(tmp_path)
   profiles_dir = _make_profiles_dir(tmp_path)
 
@@ -194,11 +265,39 @@ def test_non_dry_run_fails(tmp_path):
       tmp_path / "workspace",
       dry_run=False,
       profiles_dir=profiles_dir,
+      max_candidates=0,
     )
   except ValueError as exc:
-    assert "non-dry-run" in str(exc)
+    assert "max-candidates" in str(exc)
   else:
     raise AssertionError("expected ValueError")
+
+
+def test_non_dry_run_mir_seed_creates_no_candidates(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = tmp_path / "profiles"
+  _write(
+    llvm_root / "llvm" / "test" / "CodeGen" / "DLC" / "example.mir",
+    "# RUN: llc -run-pass=legalizer %s -o - | FileCheck %s\n"
+    "# CHECK: G_ADD\n"
+    "%0:_(s32) = COPY $r12\n",
+  )
+  _write(
+    profiles_dir / "mir.yaml",
+    _make_profile_text("mir", "llvm/test/CodeGen/DLC/example.mir"),
+  )
+
+  manifest = create_workspace(
+    llvm_root,
+    "mir",
+    "llvm/test/CodeGen/DLC/example.mir",
+    tmp_path / "workspace",
+    dry_run=False,
+    profiles_dir=profiles_dir,
+  )
+
+  assert manifest.candidate_count == 0
+  assert list((tmp_path / "workspace" / "candidates").iterdir()) == []
 
 
 def test_cli_generate_dry_run_outputs_json(tmp_path, capsys):
@@ -235,6 +334,39 @@ def test_cli_generate_dry_run_outputs_json(tmp_path, capsys):
   assert result["manifest"] == str(out_dir / "manifest.json")
 
 
+def test_cli_generate_non_dry_run_outputs_json(tmp_path, capsys):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  out_dir = tmp_path / "workspace"
+
+  assert (
+    main(
+      [
+        "generate",
+        "--llvm-root",
+        str(llvm_root),
+        "--profile",
+        "example",
+        "--seed",
+        "llvm/test/CodeGen/DLC/example.ll",
+        "--out-dir",
+        str(out_dir),
+        "--profiles-dir",
+        str(profiles_dir),
+        "--max-candidates",
+        "2",
+      ]
+    )
+    == 0
+  )
+
+  captured = capsys.readouterr()
+  result = json.loads(captured.out)
+  assert result["status"] == "generated"
+  assert result["candidate_count"] == 2
+  assert (out_dir / "candidates" / "candidate-0001.ll").is_file()
+
+
 def _make_profile_text(name, seed):
   return f"""name: {name}
 description: Example generation profile.
@@ -253,7 +385,7 @@ validation:
 mutation_axes:
   immediates:
     enabled: true
-    values: [0, 1]
+    values: [0, 1, 6]
 bug_scout:
   enabled: true
   classify_crash: true

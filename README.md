@@ -3,9 +3,10 @@
 DLC TestForge is a standalone helper for building DLC CodeGen test mutation
 workflows around an existing LLVM checkout.
 
-Current phases discover the local LLVM/DLC environment and build read-only indexes for
-existing tests, DLC specs, and DLC TableGen/source evidence. They do not generate tests,
-mutate LLVM files, or run the DLC CodeGen suite.
+Current phases discover the local LLVM/DLC environment, build read-only indexes for
+existing tests, DLC specs, and DLC TableGen/source evidence, create mutation
+workspaces, generate conservative candidate files, and validate individual
+candidates. They do not mutate checked-in LLVM files or run the DLC CodeGen suite.
 
 ## Usage
 
@@ -19,6 +20,7 @@ python3 -m dlc_testforge.cli lookup-spec --index /tmp/dlc-spec-index.json --topi
 python3 -m dlc_testforge.cli extract-td --llvm-root /root/LLVM --out /tmp/dlc-td-index.json
 python3 -m dlc_testforge.cli list-profiles --llvm-root /root/LLVM
 python3 -m dlc_testforge.cli generate --llvm-root /root/LLVM --profile machine_addropt --seed llvm/test/CodeGen/DLC/machine-addropt-prera.ll --out-dir /tmp/dlc-mutation-run --dry-run
+python3 -m dlc_testforge.cli generate --llvm-root /root/LLVM --profile machine_addropt --seed llvm/test/CodeGen/DLC/machine-addropt-prera.ll --out-dir /tmp/dlc-mutation-run --max-candidates 10
 python3 -m dlc_testforge.cli validate --llvm-root /root/LLVM --candidate /root/LLVM/llvm/test/CodeGen/DLC/machine-addropt-prera.ll --profile machine_addropt --out-dir /tmp/dlc-validation
 ```
 
