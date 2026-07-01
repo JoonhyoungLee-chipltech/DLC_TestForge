@@ -21,6 +21,7 @@ from dlc_testforge.index import build_index, write_index
 from dlc_testforge.generate import create_workspace, generation_summary
 from dlc_testforge.paths import discover_environment
 from dlc_testforge.profiles import load_profiles, profile_summary
+from dlc_testforge.report import write_report_bundle, write_report_summary
 from dlc_testforge.validate import validate_candidate, validation_summary
 
 
@@ -193,6 +194,21 @@ def cmd_classify(args: argparse.Namespace) -> int:
     print(f"error: {exc}", file=sys.stderr)
     return 2
   _print_json(classification_summary(report))
+  return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+  try:
+    summary = write_report_bundle(args.run_dir)
+    if args.out is not None:
+      write_report_summary(summary, args.out)
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  _print_json(summary.to_dict())
   return 0
 
 
@@ -375,6 +391,23 @@ def build_parser() -> argparse.ArgumentParser:
     help="Optional path to write full classification JSON.",
   )
   classify_parser.set_defaults(func=cmd_classify)
+
+  report_parser = subparsers.add_parser(
+    "report", help="Write review bundles from classification JSON files."
+  )
+  report_parser.add_argument(
+    "--run-dir",
+    required=True,
+    type=Path,
+    help="Mutation workspace containing manifest.json and results/classifications.",
+  )
+  report_parser.add_argument(
+    "--out",
+    type=Path,
+    default=None,
+    help="Optional path to write report summary JSON.",
+  )
+  report_parser.set_defaults(func=cmd_report)
 
   return parser
 

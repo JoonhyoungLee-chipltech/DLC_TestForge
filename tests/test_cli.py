@@ -20,6 +20,7 @@ def test_help_exits_without_llvm_checkout(capsys):
   assert "generate" in captured.out
   assert "validate" in captured.out
   assert "classify" in captured.out
+  assert "report" in captured.out
 
 
 def test_env_missing_llvm_root_exits_nonzero(tmp_path, capsys):
