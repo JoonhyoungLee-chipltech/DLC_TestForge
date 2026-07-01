@@ -18,6 +18,7 @@ def test_help_exits_without_llvm_checkout(capsys):
   assert "lookup-spec" in captured.out
   assert "list-profiles" in captured.out
   assert "generate" in captured.out
+  assert "validate" in captured.out
 
 
 def test_env_missing_llvm_root_exits_nonzero(tmp_path, capsys):

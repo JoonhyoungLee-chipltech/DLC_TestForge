@@ -16,6 +16,7 @@ from dlc_testforge.index import build_index, write_index
 from dlc_testforge.generate import create_workspace, generation_summary
 from dlc_testforge.paths import discover_environment
 from dlc_testforge.profiles import load_profiles, profile_summary
+from dlc_testforge.validate import validate_candidate, validation_summary
 
 
 def _add_llvm_root(parser: argparse.ArgumentParser) -> None:
@@ -154,6 +155,26 @@ def cmd_generate(args: argparse.Namespace) -> int:
   return 0
 
 
+def cmd_validate(args: argparse.Namespace) -> int:
+  try:
+    report = validate_candidate(
+      args.llvm_root,
+      args.candidate,
+      args.profile,
+      args.out_dir,
+      profiles_dir=args.profiles_dir,
+      timeout=args.timeout,
+    )
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  _print_json(validation_summary(report))
+  return 0 if report.overall_status != "fail" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="dlc-testforge",
@@ -269,6 +290,41 @@ def build_parser() -> argparse.ArgumentParser:
     help="Create workspace inputs but do not write candidate files.",
   )
   generate_parser.set_defaults(func=cmd_generate)
+
+  validate_parser = subparsers.add_parser(
+    "validate", help="Validate one DLC mutation candidate."
+  )
+  _add_llvm_root(validate_parser)
+  validate_parser.add_argument(
+    "--candidate",
+    required=True,
+    type=Path,
+    help="Candidate .ll or .mir file to validate.",
+  )
+  validate_parser.add_argument(
+    "--profile",
+    required=True,
+    help="Profile name to use.",
+  )
+  validate_parser.add_argument(
+    "--out-dir",
+    required=True,
+    type=Path,
+    help="Directory for validation status and logs.",
+  )
+  validate_parser.add_argument(
+    "--profiles-dir",
+    type=Path,
+    default=None,
+    help="Optional directory of profile YAML files to load.",
+  )
+  validate_parser.add_argument(
+    "--timeout",
+    type=int,
+    default=30,
+    help="Per-command timeout in seconds.",
+  )
+  validate_parser.set_defaults(func=cmd_validate)
 
   return parser
 
