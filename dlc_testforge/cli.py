@@ -21,6 +21,7 @@ from dlc_testforge.index import build_index, write_index
 from dlc_testforge.generate import create_workspace, generation_summary
 from dlc_testforge.paths import discover_environment
 from dlc_testforge.profiles import load_profiles, profile_summary
+from dlc_testforge.reduce import reduce_bug_bundle, reduction_summary
 from dlc_testforge.report import write_report_bundle, write_report_summary
 from dlc_testforge.validate import validate_candidate, validation_summary
 
@@ -209,6 +210,26 @@ def cmd_report(args: argparse.Namespace) -> int:
     print(f"error: {exc}", file=sys.stderr)
     return 2
   _print_json(summary.to_dict())
+  return 0
+
+
+def cmd_reduce(args: argparse.Namespace) -> int:
+  try:
+    report = reduce_bug_bundle(
+      args.bundle_dir,
+      args.llvm_root,
+      args.profile,
+      args.out_dir,
+      profiles_dir=args.profiles_dir,
+      timeout=args.timeout,
+    )
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  _print_json(reduction_summary(report))
   return 0
 
 
@@ -408,6 +429,41 @@ def build_parser() -> argparse.ArgumentParser:
     help="Optional path to write report summary JSON.",
   )
   report_parser.set_defaults(func=cmd_report)
+
+  reduce_parser = subparsers.add_parser(
+    "reduce", help="Reduce one bug-scout report bundle."
+  )
+  _add_llvm_root(reduce_parser)
+  reduce_parser.add_argument(
+    "--bundle-dir",
+    required=True,
+    type=Path,
+    help="Path to a reports/bug-scout/<candidate-id> bundle.",
+  )
+  reduce_parser.add_argument(
+    "--profile",
+    required=True,
+    help="Profile name to use for validation.",
+  )
+  reduce_parser.add_argument(
+    "--out-dir",
+    required=True,
+    type=Path,
+    help="Directory for reduction attempts and result files.",
+  )
+  reduce_parser.add_argument(
+    "--profiles-dir",
+    type=Path,
+    default=None,
+    help="Optional directory of profile YAML files to load.",
+  )
+  reduce_parser.add_argument(
+    "--timeout",
+    type=int,
+    default=30,
+    help="Per-command timeout in seconds.",
+  )
+  reduce_parser.set_defaults(func=cmd_reduce)
 
   return parser
 

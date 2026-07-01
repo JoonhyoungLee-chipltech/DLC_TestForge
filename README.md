@@ -6,8 +6,9 @@ workflows around an existing LLVM checkout.
 Current phases discover the local LLVM/DLC environment, build read-only indexes for
 existing tests, DLC specs, and DLC TableGen/source evidence, create mutation
 workspaces, generate conservative candidate files, and validate individual
-candidates. They also classify validation results and write review bundles. They
-do not mutate checked-in LLVM files or run the DLC CodeGen suite.
+candidates. They also classify validation results, write review bundles, and
+conservatively reduce bug-scout reproducers. They do not mutate checked-in LLVM
+files or run the DLC CodeGen suite.
 
 ## Usage
 
@@ -25,6 +26,7 @@ python3 -m dlc_testforge.cli generate --llvm-root /root/LLVM --profile machine_a
 python3 -m dlc_testforge.cli validate --llvm-root /root/LLVM --candidate /root/LLVM/llvm/test/CodeGen/DLC/machine-addropt-prera.ll --profile machine_addropt --out-dir /tmp/dlc-validation
 python3 -m dlc_testforge.cli classify --validation /tmp/dlc-validation/status.json
 python3 -m dlc_testforge.cli report --run-dir /tmp/dlc-mutation-run
+python3 -m dlc_testforge.cli reduce --bundle-dir /tmp/dlc-mutation-run/reports/bug-scout/candidate-0001 --llvm-root /root/LLVM --profile machine_addropt --out-dir /tmp/dlc-reduction-candidate-0001
 ```
 
 Run tests with:
