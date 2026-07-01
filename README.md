@@ -12,6 +12,7 @@ It does not generate tests, mutate LLVM files, or run the DLC CodeGen suite.
 python3 -m dlc_testforge.cli --help
 python3 -m dlc_testforge.cli env --llvm-root /root/LLVM
 python3 -m dlc_testforge.cli check-tools --llvm-root /root/LLVM
+python3 -m dlc_testforge.cli index --llvm-root /root/LLVM --out /tmp/dlc-test-index.json
 ```
 
 Run tests with:

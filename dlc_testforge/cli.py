@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from dlc_testforge.index import build_index, write_index
 from dlc_testforge.paths import discover_environment
 
 
@@ -47,6 +48,19 @@ def cmd_check_tools(args: argparse.Namespace) -> int:
   return 0 if report.ok else 2
 
 
+def cmd_index(args: argparse.Namespace) -> int:
+  try:
+    index = build_index(args.llvm_root)
+    write_index(index, args.out)
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="dlc-testforge",
@@ -65,6 +79,18 @@ def build_parser() -> argparse.ArgumentParser:
   )
   _add_llvm_root(check_parser)
   check_parser.set_defaults(func=cmd_check_tools)
+
+  index_parser = subparsers.add_parser(
+    "index", help="Index existing DLC CodeGen .ll and .mir tests."
+  )
+  _add_llvm_root(index_parser)
+  index_parser.add_argument(
+    "--out",
+    required=True,
+    type=Path,
+    help="Path to write the test index JSON.",
+  )
+  index_parser.set_defaults(func=cmd_index)
 
   return parser
 
