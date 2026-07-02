@@ -181,11 +181,37 @@ def test_candidate_outside_test_tree_skips_lit(tmp_path):
     llvm_root, candidate, "example", tmp_path / "validation", profiles_dir=profiles_dir
   )
 
-  assert report.overall_status == "pass"
+  assert report.overall_status == "needs-checks"
   filecheck = [step for step in report.steps if step.level == "filecheck"][0]
   assert filecheck.status == "skipped"
   assert filecheck.reason is not None
   assert "lit_unavailable" in filecheck.reason
+
+
+def test_candidate_outside_test_tree_can_stage_for_lit(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  candidate = _candidate(tmp_path / "outside.ll")
+
+  report = validate_candidate(
+    llvm_root,
+    candidate,
+    "example",
+    tmp_path / "validation",
+    profiles_dir=profiles_dir,
+    stage_in_tree=True,
+  )
+
+  assert report.overall_status == "pass"
+  filecheck = [step for step in report.steps if step.level == "filecheck"][0]
+  assert filecheck.status == "pass"
+  assert filecheck.details is not None
+  assert filecheck.details["staged_from"] == str(candidate.resolve(strict=False))
+  staged_path = filecheck.details["staged_path"]
+  assert ".dlc-testforge-staging" in staged_path
+  assert not any(
+    (llvm_root / "llvm" / "test" / "CodeGen" / "DLC" / ".dlc-testforge-staging").iterdir()
+  )
 
 
 def test_mir_candidate_skips_syntax_and_runs_command(tmp_path):

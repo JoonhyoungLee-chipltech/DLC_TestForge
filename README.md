@@ -149,13 +149,27 @@ Proposal shape:
     {
       "axis": "shift_amount_boundary",
       "location_hint": "function shl_add_shra_combine",
-      "old_value": 7,
-      "new_value": 8,
+      "edits": [
+        {
+          "old_value": 7,
+          "new_value": 8,
+          "occurrence": 1
+        },
+        {
+          "old_value": 7,
+          "new_value": 8,
+          "occurrence": 2
+        }
+      ],
       "rationale": "exercise adjacent shift boundary"
     }
   ]
 }
 ```
+
+For backward compatibility, a mutation may still use top-level `old_value` and
+`new_value`. Prefer `edits` when related immediates must be changed together in
+one candidate.
 
 ## Validation and Reports
 
@@ -169,6 +183,25 @@ python3 -m dlc_testforge.cli validate \
   --out-dir /tmp/dlc-validation-candidate-0001
 ```
 
+Out-of-tree candidates under `/tmp` can pass syntax and `llc` checks while still
+needing FileCheck coverage. In that case validation reports `needs-checks`.
+
+To run `llvm-lit` in the normal LLVM test-tree context without permanently
+adding the candidate to the repository, use temporary staging:
+
+```bash
+python3 -m dlc_testforge.cli validate \
+  --llvm-root /root/LLVM \
+  --candidate /tmp/dlc-mutation-run/candidates/candidate-0001.ll \
+  --profile machine_addropt \
+  --out-dir /tmp/dlc-validation-candidate-0001-staged \
+  --stage-in-tree
+```
+
+`--stage-in-tree` copies the candidate under
+`llvm/test/CodeGen/DLC/.dlc-testforge-staging`, runs `llvm-lit`, then removes the
+staged file.
+
 Classify the validation result:
 
 ```bash
@@ -176,6 +209,13 @@ python3 -m dlc_testforge.cli classify \
   --validation /tmp/dlc-validation-candidate-0001/status.json \
   --out /tmp/dlc-mutation-run/results/classifications/candidate-0001.json
 ```
+
+Important classification states:
+
+- `accepted-regression-candidate`: required validation levels passed;
+- `needs-checks`: required checks were missing or skipped;
+- `rejected-check-failure`: FileCheck ran and failed;
+- `bug-scout-*`: compiler crash, assertion, timeout, or compile failure candidate.
 
 Write review bundles:
 

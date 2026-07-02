@@ -37,6 +37,7 @@ class CandidateRecord:
   line: int
   comment: str
   rationale: str | None = None
+  edits: list[dict[str, Any]] | None = None
 
   def to_dict(self) -> dict[str, Any]:
     data = {
@@ -51,6 +52,8 @@ class CandidateRecord:
     }
     if self.rationale is not None:
       data["rationale"] = self.rationale
+    if self.edits is not None:
+      data["edits"] = self.edits
     return data
 
 
@@ -334,32 +337,38 @@ def _generate_agent_candidates(
   rejections: list[dict[str, Any]] = []
   used_locations: set[tuple[int, int, int]] = set()
   for index, proposal in enumerate(proposals):
-    match = _find_agent_mutation_location(lines, proposal, used_locations)
-    if match is None:
+    matches = _find_agent_mutation_locations(lines, proposal, used_locations)
+    if matches is None:
       rejections.append(
         {
           "index": index,
           "mutation": proposal.to_dict(),
-          "reason": "old_value was not found on a mutable seed line for the requested axis",
+          "reason": "one or more old_value entries were not found on mutable seed lines for the requested axis",
         }
       )
       continue
-    line_index, start, end = match
-    used_locations.add((line_index, start, end))
+    for line_index, start, end, _ in matches:
+      used_locations.add((line_index, start, end))
     candidate_number = len(candidates) + 1
     filename = f"candidate-{candidate_number:04d}.ll"
+    edit_summary = ",".join(
+      f"{edit.old_value}->{edit.new_value}" for edit in proposal.edits
+    )
     comment = (
       f"; DLC-MUTATION: profile={profile_name} mode=agent axis={proposal.axis} "
-      f"source_value={proposal.old_value} new_value={proposal.new_value}"
+      f"edits={edit_summary}"
     )
     candidate_lines = list(lines)
-    line = lines[line_index]
-    candidate_lines[line_index] = (
-      f"{comment}\n"
-      f"{line[:start]}{proposal.new_value}{line[end:]}"
-    )
+    for edit_index, (line_index, start, end, edit) in enumerate(
+      sorted(matches, key=lambda item: (item[0], item[1]), reverse=True)
+    ):
+      line = candidate_lines[line_index]
+      candidate_lines[line_index] = f"{line[:start]}{edit.new_value}{line[end:]}"
+      if edit_index == len(matches) - 1:
+        candidate_lines[line_index] = f"{comment}\n{candidate_lines[line_index]}"
     candidate_path = candidates_dir / filename
     candidate_path.write_text("".join(candidate_lines), encoding="utf-8")
+    first_line = min(line_index for line_index, _, _, _ in matches)
     candidates.append(
       CandidateRecord(
         path=f"candidates/{filename}",
@@ -368,32 +377,91 @@ def _generate_agent_candidates(
         mutation_axis=proposal.axis,
         source_value=proposal.old_value,
         new_value=proposal.new_value,
-        line=line_index + 1,
+        line=first_line + 1,
         comment=comment,
         rationale=proposal.rationale,
+        edits=[
+          {
+            "old_value": edit.old_value,
+            "new_value": edit.new_value,
+            "line": line_index + 1,
+          }
+          for line_index, _, _, edit in sorted(matches, key=lambda item: item[0])
+        ],
       )
     )
   return candidates, rejections
 
 
-def _find_agent_mutation_location(
+def _find_agent_mutation_locations(
   lines: list[str],
   proposal: AgentMutationProposal,
   used_locations: set[tuple[int, int, int]],
+) -> list[tuple[int, int, int, Any]] | None:
+  matches: list[tuple[int, int, int, Any]] = []
+  scoped_indices = set(_line_indices_for_hint(lines, proposal.location_hint))
+  for edit in proposal.edits:
+    match = _find_agent_edit_location(
+      lines,
+      proposal.axis,
+      edit.old_value,
+      edit.occurrence,
+      scoped_indices,
+      used_locations | {(line, start, end) for line, start, end, _ in matches},
+    )
+    if match is None:
+      return None
+    line_index, start, end = match
+    matches.append((line_index, start, end, edit))
+  return matches
+
+
+def _find_agent_edit_location(
+  lines: list[str],
+  axis: str,
+  old_value: int,
+  occurrence: int | None,
+  scoped_indices: set[int],
+  used_locations: set[tuple[int, int, int]],
 ) -> tuple[int, int, int] | None:
+  seen = 0
   for line_index, line in enumerate(lines):
+    if scoped_indices and line_index not in scoped_indices:
+      continue
     if not _is_mutable_ir_line(line):
       continue
-    if not _agent_axis_matches_line(proposal.axis, line):
+    if not _agent_axis_matches_line(axis, line):
       continue
     for match in INTEGER_RE.finditer(line):
-      if int(match.group(0)) != proposal.old_value:
+      if int(match.group(0)) != old_value:
+        continue
+      seen += 1
+      if occurrence is not None and seen != occurrence:
         continue
       location = (line_index, match.start(), match.end())
       if location in used_locations:
         continue
       return location
   return None
+
+
+def _line_indices_for_hint(lines: list[str], location_hint: str) -> list[int]:
+  match = re.search(r"@([A-Za-z_][A-Za-z0-9_.$-]*)", location_hint)
+  if match is None:
+    return []
+  function_name = match.group(1)
+  start = None
+  brace_depth = 0
+  for index, line in enumerate(lines):
+    if start is None:
+      if f"@{function_name}" in line and line.lstrip().startswith("define "):
+        start = index
+        brace_depth += line.count("{") - line.count("}")
+      continue
+    brace_depth += line.count("{") - line.count("}")
+    if brace_depth <= 0:
+      return list(range(start, index + 1))
+  return list(range(start, len(lines))) if start is not None else []
 
 
 def _agent_axis_matches_line(axis: str, line: str) -> bool:

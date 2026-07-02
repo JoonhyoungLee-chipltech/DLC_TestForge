@@ -176,6 +176,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
       args.out_dir,
       profiles_dir=args.profiles_dir,
       timeout=args.timeout,
+      stage_in_tree=args.stage_in_tree,
     )
   except OSError as exc:
     print(f"error: {exc}", file=sys.stderr)
@@ -413,6 +414,14 @@ def build_parser() -> argparse.ArgumentParser:
     type=int,
     default=30,
     help="Per-command timeout in seconds.",
+  )
+  validate_parser.add_argument(
+    "--stage-in-tree",
+    action="store_true",
+    help=(
+      "Temporarily copy an out-of-tree candidate under llvm/test/CodeGen/DLC "
+      "before running llvm-lit/FileCheck."
+    ),
   )
   validate_parser.set_defaults(func=cmd_validate)
 

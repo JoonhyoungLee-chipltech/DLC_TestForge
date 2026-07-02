@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import shlex
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ class ValidationStep:
   stderr_path: Path | None = None
   duration_ms: int | None = None
   reason: str | None = None
+  details: dict[str, Any] | None = None
 
   def to_dict(self) -> dict[str, Any]:
     data: dict[str, Any] = {
@@ -39,6 +42,8 @@ class ValidationStep:
       "duration_ms": self.duration_ms,
       "reason": self.reason,
     }
+    if self.details is not None:
+      data["details"] = self.details
     return data
 
 
@@ -71,6 +76,7 @@ def validate_candidate(
   *,
   profiles_dir: Path | None = None,
   timeout: int = 30,
+  stage_in_tree: bool = False,
 ) -> ValidationReport:
   llvm_root = llvm_root.expanduser().resolve(strict=False)
   candidate = candidate.expanduser().resolve(strict=False)
@@ -84,6 +90,7 @@ def validate_candidate(
     raise ValueError(f"LLVM environment is incomplete: {missing}")
 
   profile = get_profile(profile_name, profiles_dir)
+  required_levels = _required_levels(profile.validation)
   logs_dir = out_dir / "logs"
   logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -91,13 +98,20 @@ def validate_candidate(
     _syntax_step(env.tools["llvm-as"].path.path, candidate, out_dir, logs_dir, timeout),
     _command_step(env.tools["llc"].path.path, candidate, profile.commands, logs_dir, timeout),
     _spec_step(),
-    _filecheck_step(env.tools["llvm-lit"].path.path, llvm_root, candidate, logs_dir, timeout),
+    _filecheck_step(
+      env.tools["llvm-lit"].path.path,
+      llvm_root,
+      candidate,
+      logs_dir,
+      timeout,
+      stage_in_tree,
+    ),
     _suite_step(llvm_root),
   ]
   report = ValidationReport(
     candidate=candidate,
     profile=profile.name,
-    overall_status=_overall_status(steps),
+    overall_status=_overall_status(steps, required_levels),
     steps=steps,
     suggested_suite_command=f"ninja -C {llvm_root / 'build'} check-llvm-codegen-dlc",
     out_dir=out_dir,
@@ -115,6 +129,11 @@ def validation_summary(report: ValidationReport) -> dict[str, Any]:
     "step_count": len(report.steps),
     "failed_steps": [
       step.level for step in report.steps if step.status == "fail"
+    ],
+    "needs_check_steps": [
+      step.level
+      for step in report.steps
+      if step.status in {"needs-checks", "skipped", "unknown"}
     ],
   }
 
@@ -175,6 +194,7 @@ def _filecheck_step(
   candidate: Path,
   logs_dir: Path,
   timeout: int,
+  stage_in_tree: bool,
 ) -> ValidationStep:
   text = candidate.read_text(encoding="utf-8", errors="replace")
   if not RUN_RE.search(text) or not CHECK_RE.search(text):
@@ -184,6 +204,8 @@ def _filecheck_step(
       reason="candidate has no RUN/CHECK lines",
     )
   if not _is_under(candidate, llvm_root / "llvm" / "test"):
+    if stage_in_tree:
+      return _staged_filecheck_step(llvm_lit, llvm_root, candidate, logs_dir, timeout)
     return ValidationStep(
       level="filecheck",
       status="skipped",
@@ -192,6 +214,40 @@ def _filecheck_step(
   return _command_result_step(
     "filecheck", [str(llvm_lit), "-sv", str(candidate)], logs_dir, timeout
   )
+
+
+def _staged_filecheck_step(
+  llvm_lit: Path,
+  llvm_root: Path,
+  candidate: Path,
+  logs_dir: Path,
+  timeout: int,
+) -> ValidationStep:
+  staging_dir = llvm_root / "llvm" / "test" / "CodeGen" / "DLC" / ".dlc-testforge-staging"
+  staging_dir.mkdir(parents=True, exist_ok=True)
+  staged_candidate = staging_dir / f"{candidate.stem}-{uuid.uuid4().hex[:12]}{candidate.suffix}"
+  shutil.copyfile(candidate, staged_candidate)
+  try:
+    step = _command_result_step(
+      "filecheck", [str(llvm_lit), "-sv", str(staged_candidate)], logs_dir, timeout
+    )
+    return ValidationStep(
+      level=step.level,
+      status=step.status,
+      command=step.command,
+      exit_code=step.exit_code,
+      stdout_path=step.stdout_path,
+      stderr_path=step.stderr_path,
+      duration_ms=step.duration_ms,
+      reason=step.reason,
+      details={
+        "staged_from": str(candidate),
+        "staged_path": str(staged_candidate),
+        "staged_removed": True,
+      },
+    )
+  finally:
+    staged_candidate.unlink(missing_ok=True)
 
 
 def _suite_step(llvm_root: Path) -> ValidationStep:
@@ -231,13 +287,25 @@ def _write_command_logs(
   stderr_path.write_text(result.stderr, encoding="utf-8")
 
 
-def _overall_status(steps: list[ValidationStep]) -> str:
+def _overall_status(steps: list[ValidationStep], required_levels: list[str]) -> str:
   statuses = [step.status for step in steps]
   if "fail" in statuses:
     return "fail"
+  by_level = {step.level: step for step in steps}
+  for level in required_levels:
+    step = by_level.get(level)
+    if step is None or step.status in {"needs-checks", "skipped", "unknown"}:
+      return "needs-checks"
   if "needs-checks" in statuses:
     return "needs-checks"
   return "pass"
+
+
+def _required_levels(validation: dict[str, Any]) -> list[str]:
+  levels = validation.get("required_levels", ["syntax", "command", "filecheck"])
+  if not isinstance(levels, list) or not all(isinstance(level, str) for level in levels):
+    return ["syntax", "command", "filecheck"]
+  return list(levels)
 
 
 def _write_status(report: ValidationReport, path: Path) -> None:

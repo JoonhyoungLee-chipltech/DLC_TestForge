@@ -161,13 +161,34 @@ def _classify_steps(
 
   for level, step in steps.items():
     if step.get("status") == "needs-checks":
-      return "needs-checks", f"{level} requires FileCheck coverage", [level]
+      reason = step.get("reason")
+      suffix = f": {reason}" if reason else ""
+      return "needs-checks", f"{level} requires additional checks{suffix}", [level]
 
   filecheck = steps.get("filecheck")
+  if "filecheck" in required_levels and filecheck is not None:
+    if filecheck.get("status") == "fail":
+      return "rejected-check-failure", "required FileCheck validation failed", ["filecheck"]
+
   if "filecheck" in required_levels and (
     filecheck is None or filecheck.get("status") in {"skipped", "needs-checks"}
   ):
-    return "needs-checks", "required FileCheck validation did not pass", ["filecheck"]
+    if filecheck is None:
+      return "needs-checks", "required FileCheck validation is missing", ["filecheck"]
+    reason = filecheck.get("reason")
+    if filecheck.get("status") == "skipped":
+      suffix = f": {reason}" if reason else ""
+      return (
+        "needs-checks",
+        f"required FileCheck validation was skipped{suffix}",
+        ["filecheck"],
+      )
+    suffix = f": {reason}" if reason else ""
+    return (
+      "needs-checks",
+      f"required FileCheck validation needs checks{suffix}",
+      ["filecheck"],
+    )
 
   if all(_required_level_passed(steps, level) for level in required_levels):
     return (

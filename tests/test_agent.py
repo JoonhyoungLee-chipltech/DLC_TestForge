@@ -35,6 +35,37 @@ def test_parse_agent_proposal_accepts_json_fence():
   assert proposal.proposed_mutations[0].new_value == 6
 
 
+def test_parse_agent_proposal_accepts_grouped_edits():
+  proposal = parse_agent_proposal(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "proposed_mutations": [
+          {
+            "axis": "shift_amount_boundary",
+            "location_hint": "@example",
+            "edits": [
+              {"old_value": 7, "new_value": 6, "occurrence": 1},
+              {"old_value": 7, "new_value": 6, "occurrence": 2},
+            ],
+            "rationale": "keep paired shifts aligned",
+          }
+        ],
+      }
+    )
+  )
+
+  mutation = proposal.proposed_mutations[0]
+  assert mutation.old_value == 7
+  assert mutation.new_value == 6
+  assert [edit.occurrence for edit in mutation.edits] == [1, 2]
+  assert mutation.to_dict()["edits"] == [
+    {"old_value": 7, "new_value": 6, "occurrence": 1},
+    {"old_value": 7, "new_value": 6, "occurrence": 2},
+  ]
+
+
 def test_filter_agent_mutations_rejects_unsupported_axis_and_value(tmp_path):
   profiles_dir = _make_profiles_dir(tmp_path)
   profile = get_profile("example", profiles_dir)

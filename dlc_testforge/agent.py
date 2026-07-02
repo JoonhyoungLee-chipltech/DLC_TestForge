@@ -18,21 +18,46 @@ CODEX_CONFIG_PATH = Path("/root/.codex/config.toml")
 
 
 @dataclass(frozen=True)
+class AgentMutationEdit:
+  old_value: int
+  new_value: int
+  occurrence: int | None = None
+
+  def to_dict(self) -> dict[str, Any]:
+    data = {
+      "old_value": self.old_value,
+      "new_value": self.new_value,
+    }
+    if self.occurrence is not None:
+      data["occurrence"] = self.occurrence
+    return data
+
+
+@dataclass(frozen=True)
 class AgentMutationProposal:
   axis: str
   location_hint: str
-  old_value: int
-  new_value: int
+  edits: list[AgentMutationEdit]
   rationale: str
 
+  @property
+  def old_value(self) -> int:
+    return self.edits[0].old_value
+
+  @property
+  def new_value(self) -> int:
+    return self.edits[0].new_value
+
   def to_dict(self) -> dict[str, Any]:
-    return {
+    data = {
       "axis": self.axis,
       "location_hint": self.location_hint,
       "old_value": self.old_value,
       "new_value": self.new_value,
+      "edits": [edit.to_dict() for edit in self.edits],
       "rationale": self.rationale,
     }
+    return data
 
 
 @dataclass(frozen=True)
@@ -89,8 +114,7 @@ def build_agent_context(
       "required_mutation_fields": [
         "axis",
         "location_hint",
-        "old_value",
-        "new_value",
+        "edits",
         "rationale",
       ],
     },
@@ -107,9 +131,10 @@ def build_agent_context(
     "guardrails": [
       "Use the exact seed and profile from this context.",
       "Only propose immediate-value mutations supported by profile.mutation_axes.immediates.values.",
+      "Use edits when one candidate must change multiple related immediate occurrences together.",
       "Do not change RUN lines.",
       "Do not invent DLC instructions or intrinsics.",
-      "Each proposed mutation must change one old_value to one new_value.",
+      "Each edit must change one old_value to one new_value.",
     ],
   }
 
@@ -187,8 +212,13 @@ def request_agent_proposal(
                   {
                     "axis": "shift_amount_boundary",
                     "location_hint": "function or line hint",
-                    "old_value": 7,
-                    "new_value": 6,
+                    "edits": [
+                      {
+                        "old_value": 7,
+                        "new_value": 6,
+                        "occurrence": 1,
+                      }
+                    ],
                     "rationale": "why this edge case is worth trying",
                   }
                 ],
@@ -415,26 +445,65 @@ def _parse_mutation(index: int, item: Any) -> AgentMutationProposal:
     raise ValueError(f"proposed_mutations[{index}] must be a JSON object")
   axis = item.get("axis")
   location_hint = item.get("location_hint")
-  old_value = item.get("old_value")
-  new_value = item.get("new_value")
   rationale = item.get("rationale")
   if not isinstance(axis, str) or not axis:
     raise ValueError(f"proposed_mutations[{index}].axis must be a non-empty string")
   if not isinstance(location_hint, str):
     raise ValueError(f"proposed_mutations[{index}].location_hint must be a string")
-  if not isinstance(old_value, int) or isinstance(old_value, bool):
-    raise ValueError(f"proposed_mutations[{index}].old_value must be an integer")
-  if not isinstance(new_value, int) or isinstance(new_value, bool):
-    raise ValueError(f"proposed_mutations[{index}].new_value must be an integer")
   if not isinstance(rationale, str) or not rationale:
     raise ValueError(f"proposed_mutations[{index}].rationale must be a non-empty string")
+  edits = _parse_mutation_edits(index, item)
   return AgentMutationProposal(
     axis=axis,
     location_hint=location_hint,
-    old_value=old_value,
-    new_value=new_value,
+    edits=edits,
     rationale=rationale,
   )
+
+
+def _parse_mutation_edits(index: int, item: dict[str, Any]) -> list[AgentMutationEdit]:
+  raw_edits = item.get("edits")
+  if raw_edits is None:
+    raw_edits = [
+      {
+        "old_value": item.get("old_value"),
+        "new_value": item.get("new_value"),
+      }
+    ]
+  if not isinstance(raw_edits, list) or not raw_edits:
+    raise ValueError(f"proposed_mutations[{index}].edits must be a non-empty list")
+
+  edits = []
+  for edit_index, edit in enumerate(raw_edits):
+    if not isinstance(edit, dict):
+      raise ValueError(
+        f"proposed_mutations[{index}].edits[{edit_index}] must be a JSON object"
+      )
+    old_value = edit.get("old_value")
+    new_value = edit.get("new_value")
+    occurrence = edit.get("occurrence")
+    if not isinstance(old_value, int) or isinstance(old_value, bool):
+      raise ValueError(
+        f"proposed_mutations[{index}].edits[{edit_index}].old_value must be an integer"
+      )
+    if not isinstance(new_value, int) or isinstance(new_value, bool):
+      raise ValueError(
+        f"proposed_mutations[{index}].edits[{edit_index}].new_value must be an integer"
+      )
+    if occurrence is not None and (
+      not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 1
+    ):
+      raise ValueError(
+        f"proposed_mutations[{index}].edits[{edit_index}].occurrence must be a positive integer"
+      )
+    edits.append(
+      AgentMutationEdit(
+        old_value=old_value,
+        new_value=new_value,
+        occurrence=occurrence,
+      )
+    )
+  return edits
 
 
 def _allowed_immediate_values(profile: MutationProfile) -> set[int]:
@@ -456,10 +525,11 @@ def _rejection_reason(
     "shift_amount_boundary",
   }:
     return f"unsupported mutation axis for current agent generator: {mutation.axis}"
-  if mutation.old_value == mutation.new_value:
-    return "old_value and new_value are identical"
-  if mutation.new_value not in allowed_values:
-    return f"new_value {mutation.new_value} is not allowed by profile immediates.values"
+  for edit in mutation.edits:
+    if edit.old_value == edit.new_value:
+      return "old_value and new_value are identical"
+    if edit.new_value not in allowed_values:
+      return f"new_value {edit.new_value} is not allowed by profile immediates.values"
   return None
 
 

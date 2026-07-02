@@ -208,6 +208,20 @@ def test_missing_or_skipped_required_filecheck_needs_checks(tmp_path):
   report = classify_validation(status_path, profiles_dir=profiles_dir)
 
   assert report.state == "needs-checks"
+  assert report.reason == "required FileCheck validation was skipped: lit_unavailable"
+
+
+def test_failed_required_filecheck_is_rejected_check_failure(tmp_path):
+  profiles_dir = _make_profiles_dir(tmp_path)
+  steps = _passing_steps()
+  steps[3] = _step("filecheck", "fail", exit_code=1, stderr="CHECK failed\n", tmp_path=tmp_path)
+  status_path = _status(tmp_path, steps)
+
+  report = classify_validation(status_path, profiles_dir=profiles_dir)
+
+  assert report.state == "rejected-check-failure"
+  assert report.reason == "required FileCheck validation failed"
+  assert "CHECK failed" in report.stderr_excerpt
 
 
 def test_non_required_unknown_and_skipped_do_not_block_acceptance(tmp_path):

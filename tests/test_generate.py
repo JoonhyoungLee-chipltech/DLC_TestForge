@@ -423,7 +423,7 @@ def test_agent_mode_uses_proposal_file_and_records_rejections(tmp_path):
   candidate_text = (tmp_path / "workspace" / "candidates" / "candidate-0001.ll").read_text(
     encoding="utf-8"
   )
-  assert "mode=agent axis=shift_amount_boundary source_value=7 new_value=6" in candidate_text
+  assert "mode=agent axis=shift_amount_boundary edits=7->6" in candidate_text
   assert "%shl = shl i32 %x, 6" in candidate_text
   assert manifest.candidates[0].rationale == "exercise the adjacent lower shift boundary"
 
@@ -435,7 +435,56 @@ def test_agent_mode_uses_proposal_file_and_records_rejections(tmp_path):
   assert rejections["rejection_count"] == 2
   assert [entry["reason"] for entry in rejections["rejections"]] == [
     "unsupported mutation axis for current agent generator: address_shapes",
-    "old_value was not found on a mutable seed line for the requested axis",
+    "one or more old_value entries were not found on mutable seed lines for the requested axis",
+  ]
+
+
+def test_agent_mode_applies_grouped_edits_to_one_candidate(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  proposal_path = tmp_path / "proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "proposed_mutations": [
+          {
+            "axis": "immediates",
+            "location_hint": "@example",
+            "edits": [
+              {"old_value": 7, "new_value": 6},
+              {"old_value": 5, "new_value": 1},
+            ],
+            "rationale": "mutate related immediates together",
+          }
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace",
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    mode="agent",
+    agent_proposal=proposal_path,
+  )
+
+  assert manifest.candidate_count == 1
+  candidate_text = (tmp_path / "workspace" / "candidates" / "candidate-0001.ll").read_text(
+    encoding="utf-8"
+  )
+  assert "edits=7->6,5->1" in candidate_text
+  assert "%shl = shl i32 %x, 6" in candidate_text
+  assert "%add = add i32 %shl, 1" in candidate_text
+  assert manifest.candidates[0].edits == [
+    {"old_value": 7, "new_value": 6, "line": 3},
+    {"old_value": 5, "new_value": 1, "line": 4},
   ]
 
 
