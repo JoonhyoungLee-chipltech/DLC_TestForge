@@ -17,6 +17,10 @@ from dlc_testforge.extract_spec import (
   lookup_dlc_spec,
   write_spec_index,
 )
+from dlc_testforge.extract_kernel import (
+  build_kernel_usage_index,
+  write_kernel_usage_index,
+)
 from dlc_testforge.index import build_index, write_index
 from dlc_testforge.generate import create_workspace, generation_summary
 from dlc_testforge.paths import discover_environment
@@ -95,6 +99,19 @@ def cmd_extract_td(args: argparse.Namespace) -> int:
   try:
     index = build_td_index(args.llvm_root)
     write_td_index(index, args.out)
+  except OSError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+  return 0
+
+
+def cmd_extract_kernel(args: argparse.Namespace) -> int:
+  try:
+    index = build_kernel_usage_index(args.kernel_root)
+    write_kernel_usage_index(index, args.out)
   except OSError as exc:
     print(f"error: {exc}", file=sys.stderr)
     return 2
@@ -292,6 +309,24 @@ def build_parser() -> argparse.ArgumentParser:
     help="Path to write the DLC TableGen/source evidence index JSON.",
   )
   extract_td_parser.set_defaults(func=cmd_extract_td)
+
+  extract_kernel_parser = subparsers.add_parser(
+    "extract-kernel",
+    help="Extract structured usage evidence from DLC custom kernels.",
+  )
+  extract_kernel_parser.add_argument(
+    "--kernel-root",
+    required=True,
+    type=Path,
+    help="Path to the DLC_Custom_Kernel checkout to inspect.",
+  )
+  extract_kernel_parser.add_argument(
+    "--out",
+    required=True,
+    type=Path,
+    help="Path to write the kernel usage index JSON.",
+  )
+  extract_kernel_parser.set_defaults(func=cmd_extract_kernel)
 
   lookup_spec_parser = subparsers.add_parser(
     "lookup-spec", help="Search a DLC spec index JSON by topic."
