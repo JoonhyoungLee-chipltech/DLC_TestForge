@@ -550,3 +550,90 @@ def test_generates_source_token_relation_hints(tmp_path):
     1 for relation in relations
     if relation.kind == "mask_boundary" and relation.evidence == "intrinsic=pre_exp2"
   ) == 1
+
+
+def test_generates_edge_hints_from_relations_and_usage(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_kernels" / "edge_kernel.c",
+    """void f(tensor h, tensor v, int size) {
+  int a = dlc_dma(h, HBM, v, VMEM, 128, 256, src_stride, 1024, 7);
+  int tile = 1024;
+  int mask = pre_exp2(size / 128);
+  float8_128 x = v_f32_ld_tnsr_st_msk(0, v, 1, mask);
+}
+""",
+  )
+
+  index = build_kernel_usage_index(kernel_root)
+  record = index.kernels[0]
+  edges = record.edge_hints
+  edge_map = {
+    (edge.kind, edge.base, edge.source): edge for edge in edges
+  }
+
+  assert index.summary.edge_hint_count == len(edges)
+  assert index.global_edge_hints == []
+  assert edge_map[
+    ("addr_exp_boundary", 7, "dlc_kernels/edge_kernel.c:2")
+  ].values == [6, 7, 8]
+  assert edge_map[
+    ("dma_length_boundary", 128, "dlc_kernels/edge_kernel.c:2")
+  ].values == [127, 128, 129]
+  assert edge_map[
+    ("dma_length_boundary", 1024, "dlc_kernels/edge_kernel.c:2")
+  ].values == [1023, 1024, 1025]
+  assert edge_map[
+    ("stride_boundary", 256, "dlc_kernels/edge_kernel.c:2")
+  ].values == [255, 256, 257]
+  assert edge_map[
+    ("tile_boundary", 1024, "dlc_kernels/edge_kernel.c:2")
+  ].values == [1023, 1024, 1025]
+  assert edge_map[
+    ("mask_boundary", 128, "dlc_kernels/edge_kernel.c:4")
+  ].values == [127, 128, 129]
+  assert edge_map[
+    ("vector_lane_boundary", 8, "unknown")
+  ].values == [7, 8, 9]
+  assert edge_map[
+    ("vector_lane_boundary", 128, "unknown")
+  ].values == [127, 128, 129]
+
+
+def test_edge_hints_skip_variable_only_stride_and_deduplicate(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_kernels" / "dedupe_edges.c",
+    """void f(tensor h, tensor v, int size) {
+  int a = dlc_dma(h, HBM, v, VMEM, len, src_stride, dst_stride, len, 7);
+  int b = dlc_dma(h, HBM, v, VMEM, len, src_stride, dst_stride, len, 7);
+  int mask0 = pre_exp2(size / 128);
+  int mask1 = pre_exp2(size / 128);
+}
+""",
+  )
+
+  index = build_kernel_usage_index(kernel_root)
+  edges = index.kernels[0].edge_hints
+  edge_keys = {(edge.kind, edge.base, edge.source) for edge in edges}
+
+  assert not any(edge.kind == "stride_boundary" for edge in edges)
+  assert (
+    "addr_exp_boundary",
+    7,
+    "dlc_kernels/dedupe_edges.c:2",
+  ) in edge_keys
+  assert (
+    "addr_exp_boundary",
+    7,
+    "dlc_kernels/dedupe_edges.c:3",
+  ) in edge_keys
+  assert (
+    "mask_boundary",
+    128,
+    "dlc_kernels/dedupe_edges.c:4",
+  ) in edge_keys
+  assert sum(
+    1 for edge in edges
+    if edge.kind == "mask_boundary" and edge.base == 128
+  ) == 1

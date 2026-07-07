@@ -17,6 +17,8 @@ DMA_BOUNDARY_VALUES = {128, 256, 512, 1024}
 ADDRESS_EXPONENT_VALUES = {6, 7, 8}
 STRIDE_BOUNDARY_VALUES = {128, 256}
 TILE_BOUNDARY_VALUES = {1024, 2048, 3072, 4096}
+MASK_BOUNDARY_VALUES = {8, 32, 128, 255, 256, 1024}
+VECTOR_LANE_VALUES = {8, 32, 128, 1024}
 CALL_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 INTEGER_RE = re.compile(r"(?<![A-Za-z0-9_])-?\d+(?![A-Za-z0-9_])")
 VECTOR_TYPE_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*_128\b")
@@ -229,6 +231,7 @@ def build_kernel_usage_index(kernel_root: Path) -> KernelUsageIndex:
       len(kernel.usage.vector_types) + len(kernel.usage.intrinsics)
       for kernel in kernels
     ),
+    edge_hint_count=sum(len(kernel.edge_hints) for kernel in kernels),
   )
   return KernelUsageIndex(
     root=kernel_root,
@@ -314,12 +317,14 @@ def _kernel_record(name: str, kernel_root: Path, source_path: Path | None) -> Ke
   source = _source_relative_to_root(kernel_root, source_path) if source_path else None
   source_stem = source_path.stem if source_path is not None else ""
   usage = _extract_source_usage(source_path) if source_path is not None else KernelUsage()
+  edge_hints = _generate_edge_hints(usage, source)
   return KernelRecord(
     name=name,
     source=source,
     category=_source_category(kernel_root, source_path),
     dtype_hints=_dtype_hints(name, source_stem),
     usage=usage,
+    edge_hints=edge_hints,
   )
 
 
@@ -513,6 +518,154 @@ def _is_mask_relation_intrinsic(name: str) -> bool:
     or "ldmask" in lowered
     or "stmask" in lowered
   )
+
+
+def _generate_edge_hints(usage: KernelUsage, source: str | None) -> list[EdgeHint]:
+  edge_hints: list[EdgeHint] = []
+  seen: set[tuple[str, int, str]] = set()
+
+  for relation in usage.relations:
+    if relation.kind == "address_exponent":
+      base = _first_integer(relation.evidence)
+      if base is not None:
+        _append_edge_hint(
+          edge_hints,
+          seen,
+          "addr_exp_boundary",
+          base,
+          _source_at_line(source, relation.line),
+          "exercise address exponent boundary",
+        )
+    elif relation.kind == "dma_length_boundary":
+      base = _first_integer(relation.evidence)
+      if base is not None:
+        _append_edge_hint(
+          edge_hints,
+          seen,
+          "dma_length_boundary",
+          base,
+          _source_at_line(source, relation.line),
+          "exercise DMA length or unit length boundary",
+        )
+    elif relation.kind == "stride_boundary":
+      base = _first_integer_in(relation.evidence, STRIDE_BOUNDARY_VALUES)
+      if base is not None:
+        _append_edge_hint(
+          edge_hints,
+          seen,
+          "stride_boundary",
+          base,
+          _source_at_line(source, relation.line),
+          "exercise DMA stride boundary",
+        )
+    elif relation.kind == "tile_boundary":
+      base = _first_integer(relation.evidence)
+      if base is not None:
+        _append_edge_hint(
+          edge_hints,
+          seen,
+          "tile_boundary",
+          base,
+          _source_at_line(source, relation.line),
+          "exercise tile-size boundary",
+        )
+
+  if any(relation.kind == "mask_boundary" for relation in usage.relations):
+    for base in usage.constants:
+      if base in MASK_BOUNDARY_VALUES:
+        _append_edge_hint(
+          edge_hints,
+          seen,
+          "mask_boundary",
+          base,
+          _source_at_line(source, _line_for_relation_kind(usage, "mask_boundary")),
+          "exercise mask or tail-mask boundary",
+        )
+
+  if usage.vector_types:
+    for base in _vector_lane_bases(usage):
+      _append_edge_hint(
+        edge_hints,
+        seen,
+        "vector_lane_boundary",
+        base,
+        _source_at_line(source, 0),
+        "exercise vector lane boundary",
+      )
+
+  return edge_hints
+
+
+def _append_edge_hint(
+  edge_hints: list[EdgeHint],
+  seen: set[tuple[str, int, str]],
+  kind: str,
+  base: int,
+  source: str,
+  reason: str,
+) -> None:
+  key = (kind, base, source)
+  if key in seen:
+    return
+  seen.add(key)
+  edge_hints.append(
+    EdgeHint(
+      kind=kind,
+      base=base,
+      values=_edge_values(base),
+      source=source,
+      reason=reason,
+    )
+  )
+
+
+def _edge_values(base: int) -> list[int]:
+  if base > 1:
+    return [base - 1, base, base + 1]
+  if base == 1:
+    return [0, 1, 2]
+  return [base]
+
+
+def _source_at_line(source: str | None, line: int) -> str:
+  if source is None or line <= 0:
+    return "unknown"
+  return f"{source}:{line}"
+
+
+def _first_integer(text: str) -> int | None:
+  values = _integer_values(text)
+  return values[0] if values else None
+
+
+def _first_integer_in(text: str, allowed: set[int]) -> int | None:
+  for value in _integer_values(text):
+    if value in allowed:
+      return value
+  return None
+
+
+def _line_for_relation_kind(usage: KernelUsage, kind: str) -> int:
+  for relation in usage.relations:
+    if relation.kind == kind:
+      return relation.line
+  return 0
+
+
+def _vector_lane_bases(usage: KernelUsage) -> list[int]:
+  bases = set()
+  for value in usage.constants:
+    if value in VECTOR_LANE_VALUES:
+      bases.add(value)
+  for vector_type in usage.vector_types:
+    for value in _vector_type_integer_values(vector_type):
+      if value in VECTOR_LANE_VALUES:
+        bases.add(value)
+  return sorted(bases)
+
+
+def _vector_type_integer_values(vector_type: str) -> list[int]:
+  return [int(value) for value in re.findall(r"\d+", vector_type)]
 
 
 def _extract_dma_calls(text: str) -> list[DmaCall]:
