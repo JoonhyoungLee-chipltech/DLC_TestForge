@@ -13,6 +13,10 @@ SUPPORTED_SOURCE_SUFFIXES = [".c", ".cpp", ".h", ".hpp"]
 DERIVED_KERNEL_SUFFIXES = {".c", ".cpp"}
 DTYPE_TOKENS = ["bf16", "f32", "i32", "i64", "int8", "long"]
 MEMORY_SPACES = ["HBM", "VMEM", "CMEM", "SMEM"]
+DMA_BOUNDARY_VALUES = {128, 256, 512, 1024}
+ADDRESS_EXPONENT_VALUES = {6, 7, 8}
+STRIDE_BOUNDARY_VALUES = {128, 256}
+TILE_BOUNDARY_VALUES = {1024, 2048, 3072, 4096}
 CALL_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 INTEGER_RE = re.compile(r"(?<![A-Za-z0-9_])-?\d+(?![A-Za-z0-9_])")
 VECTOR_TYPE_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*_128\b")
@@ -341,7 +345,7 @@ def _extract_source_usage(source_path: Path) -> KernelUsage:
   text = source_path.read_text(encoding="utf-8", errors="ignore")
   stripped = _strip_comments_for_token_scan(text)
   intrinsics = _extract_intrinsics(stripped)
-  return KernelUsage(
+  usage = KernelUsage(
     dma_calls=_extract_dma_calls(stripped),
     sync_calls=_extract_sync_calls(stripped),
     memory_spaces=[
@@ -350,6 +354,164 @@ def _extract_source_usage(source_path: Path) -> KernelUsage:
     vector_types=sorted(set(VECTOR_TYPE_RE.findall(stripped))),
     intrinsics=intrinsics,
     constants=sorted({int(match.group(0)) for match in INTEGER_RE.finditer(stripped)}),
+  )
+  return KernelUsage(
+    dma_calls=usage.dma_calls,
+    sync_calls=usage.sync_calls,
+    memory_spaces=usage.memory_spaces,
+    vector_types=usage.vector_types,
+    intrinsics=usage.intrinsics,
+    constants=usage.constants,
+    relations=_generate_relation_hints(usage, stripped),
+  )
+
+
+def _generate_relation_hints(usage: KernelUsage, source_text: str) -> list[RelationHint]:
+  relations: list[RelationHint] = []
+  seen: set[tuple[str, int, str]] = set()
+
+  for call in usage.dma_calls:
+    addr_exp_values = _integer_values(call.addr_exp)
+    if len(addr_exp_values) == 1 and addr_exp_values[0] in ADDRESS_EXPONENT_VALUES:
+      _append_relation(
+        relations,
+        seen,
+        "address_exponent",
+        call.line,
+        f"addr_exp={call.addr_exp}",
+        "dlc_dma address exponent is near the common x128 scaling boundary",
+      )
+
+    for field_name, value in [
+      ("length", call.length),
+      ("unit_len", call.unit_len),
+    ]:
+      if _contains_any_integer(value, DMA_BOUNDARY_VALUES):
+        _append_relation(
+          relations,
+          seen,
+          "dma_length_boundary",
+          call.line,
+          f"{field_name}={value}",
+          "DMA length or unit length references a hardware transfer boundary",
+        )
+
+    for field_name, value in [
+      ("src_stride", call.src_stride),
+      ("dst_stride", call.dst_stride),
+    ]:
+      if (
+        _contains_any_integer(value, STRIDE_BOUNDARY_VALUES)
+        or "stride" in value.lower()
+      ):
+        _append_relation(
+          relations,
+          seen,
+          "stride_boundary",
+          call.line,
+          f"{field_name}={value}",
+          "DMA stride expression may exercise strided transfer boundaries",
+        )
+
+    src_space = _normalize_memory_space(call.src_space)
+    dst_space = _normalize_memory_space(call.dst_space)
+    if src_space is not None and dst_space is not None:
+      _append_relation(
+        relations,
+        seen,
+        "memory_space_pair",
+        call.line,
+        f"{src_space}->{dst_space}",
+        "DMA transfer crosses DLC memory spaces",
+      )
+
+  for value in usage.constants:
+    if value in TILE_BOUNDARY_VALUES:
+      _append_relation(
+        relations,
+        seen,
+        "tile_boundary",
+        _line_for_text_match(source_text, rf"\b{value}\b"),
+        f"tile_constant={value}",
+        "source references a common tile-size boundary",
+      )
+
+  for intrinsic in usage.intrinsics:
+    if _is_mask_relation_intrinsic(intrinsic):
+      _append_relation(
+        relations,
+        seen,
+        "mask_boundary",
+        _line_for_text_match(source_text, rf"\b{re.escape(intrinsic)}\b"),
+        f"intrinsic={intrinsic}",
+        "source uses mask or tail-mask related operations",
+      )
+
+  if re.search(r"\bget_device_id\b", source_text):
+    _append_relation(
+      relations,
+      seen,
+      "dual_xys_split",
+      _line_for_text_match(source_text, r"\bget_device_id\b"),
+      "get_device_id",
+      "source branches or partitions work by DLC device/core id",
+    )
+
+  return relations
+
+
+def _append_relation(
+  relations: list[RelationHint],
+  seen: set[tuple[str, int, str]],
+  kind: str,
+  line: int,
+  evidence: str,
+  reason: str,
+) -> None:
+  key = (kind, line, evidence)
+  if key in seen:
+    return
+  seen.add(key)
+  relations.append(
+    RelationHint(
+      kind=kind,
+      line=line,
+      evidence=evidence,
+      reason=reason,
+    )
+  )
+
+
+def _normalize_memory_space(value: str) -> str | None:
+  normalized = value.strip()
+  if normalized.startswith("D_"):
+    normalized = normalized[2:]
+  return normalized if normalized in MEMORY_SPACES else None
+
+
+def _line_for_text_match(text: str, pattern: str) -> int:
+  match = re.search(pattern, text)
+  if match is None:
+    return 0
+  return text.count("\n", 0, match.start()) + 1
+
+
+def _contains_any_integer(text: str, values: set[int]) -> bool:
+  return any(value in values for value in _integer_values(text))
+
+
+def _integer_values(text: str) -> list[int]:
+  return [int(match.group(0)) for match in INTEGER_RE.finditer(text)]
+
+
+def _is_mask_relation_intrinsic(name: str) -> bool:
+  lowered = name.lower()
+  return (
+    name == "pre_exp2"
+    or "mask" in lowered
+    or "msk" in lowered
+    or "ldmask" in lowered
+    or "stmask" in lowered
   )
 
 

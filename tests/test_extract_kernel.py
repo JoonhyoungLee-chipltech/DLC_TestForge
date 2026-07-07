@@ -407,6 +407,7 @@ def test_source_usage_ignores_comment_only_tokens(tmp_path):
   assert usage.vector_types == []
   assert usage.intrinsics == []
   assert usage.constants == [-3]
+  assert usage.relations == []
 
 
 def test_missing_yaml_source_keeps_empty_usage(tmp_path):
@@ -426,3 +427,126 @@ def test_missing_yaml_source_keeps_empty_usage(tmp_path):
   assert usage.vector_types == []
   assert usage.intrinsics == []
   assert usage.constants == []
+  assert usage.relations == []
+
+
+def test_generates_dma_relation_hints(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_kernels" / "relations.c",
+    """void f(tensor h, tensor v) {
+  int a = dlc_dma(h, HBM, v, VMEM, 128, src_stride, 1024, 1024, 7);
+  int b = dlc_dma(v, D_VMEM, h, D_HBM, tile_len, 256, dst_stride, 128, 8);
+}
+""",
+  )
+
+  index = build_kernel_usage_index(kernel_root)
+  relations = index.kernels[0].usage.relations
+  relation_keys = {
+    (relation.kind, relation.line, relation.evidence) for relation in relations
+  }
+
+  assert (
+    "address_exponent",
+    2,
+    "addr_exp=7",
+  ) in relation_keys
+  assert (
+    "address_exponent",
+    3,
+    "addr_exp=8",
+  ) in relation_keys
+  assert (
+    "dma_length_boundary",
+    2,
+    "length=128",
+  ) in relation_keys
+  assert (
+    "dma_length_boundary",
+    2,
+    "unit_len=1024",
+  ) in relation_keys
+  assert (
+    "stride_boundary",
+    2,
+    "src_stride=src_stride",
+  ) in relation_keys
+  assert (
+    "stride_boundary",
+    3,
+    "src_stride=256",
+  ) in relation_keys
+  assert (
+    "stride_boundary",
+    3,
+    "dst_stride=dst_stride",
+  ) in relation_keys
+  assert (
+    "memory_space_pair",
+    2,
+    "HBM->VMEM",
+  ) in relation_keys
+  assert (
+    "memory_space_pair",
+    3,
+    "VMEM->HBM",
+  ) in relation_keys
+
+
+def test_generates_source_token_relation_hints(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_kernels" / "token_relations.c",
+    """void f(tensor h, tensor v, int size) {
+  int device_id = get_device_id();
+  int tile = 1024;
+  int other_tile = 2048;
+  int mask = pre_exp2(size / 128);
+  float8_128 x = v_f32_ld_tnsr_st_msk(0, v, 1, mask);
+  float8_128 y = load8_128_stride_with_ldmask(0, 1, 255, h);
+  int mask2 = pre_exp2(size / 128);
+}
+""",
+  )
+
+  index = build_kernel_usage_index(kernel_root)
+  relations = index.kernels[0].usage.relations
+  relation_keys = {
+    (relation.kind, relation.line, relation.evidence) for relation in relations
+  }
+
+  assert (
+    "tile_boundary",
+    3,
+    "tile_constant=1024",
+  ) in relation_keys
+  assert (
+    "tile_boundary",
+    4,
+    "tile_constant=2048",
+  ) in relation_keys
+  assert (
+    "mask_boundary",
+    5,
+    "intrinsic=pre_exp2",
+  ) in relation_keys
+  assert (
+    "mask_boundary",
+    6,
+    "intrinsic=v_f32_ld_tnsr_st_msk",
+  ) in relation_keys
+  assert (
+    "mask_boundary",
+    7,
+    "intrinsic=load8_128_stride_with_ldmask",
+  ) in relation_keys
+  assert (
+    "dual_xys_split",
+    2,
+    "get_device_id",
+  ) in relation_keys
+  assert sum(
+    1 for relation in relations
+    if relation.kind == "mask_boundary" and relation.evidence == "intrinsic=pre_exp2"
+  ) == 1
