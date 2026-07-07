@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,20 @@ import yaml
 SUPPORTED_SOURCE_SUFFIXES = [".c", ".cpp", ".h", ".hpp"]
 DERIVED_KERNEL_SUFFIXES = {".c", ".cpp"}
 DTYPE_TOKENS = ["bf16", "f32", "i32", "i64", "int8", "long"]
+MEMORY_SPACES = ["HBM", "VMEM", "CMEM", "SMEM"]
+CALL_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+INTEGER_RE = re.compile(r"(?<![A-Za-z0-9_])-?\d+(?![A-Za-z0-9_])")
+VECTOR_TYPE_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*_128\b")
+CONTROL_CALLS = {
+  "if",
+  "for",
+  "while",
+  "switch",
+  "return",
+  "sizeof",
+  "dlc_dma",
+  "dlc_sync",
+}
 
 
 @dataclass(frozen=True)
@@ -204,6 +219,12 @@ def build_kernel_usage_index(kernel_root: Path) -> KernelUsageIndex:
     kernel_count=len(kernels),
     source_file_count=len(source_files),
     syntest_file_count=0,
+    dma_call_count=sum(len(kernel.usage.dma_calls) for kernel in kernels),
+    sync_call_count=sum(len(kernel.usage.sync_calls) for kernel in kernels),
+    vector_usage_count=sum(
+      len(kernel.usage.vector_types) + len(kernel.usage.intrinsics)
+      for kernel in kernels
+    ),
   )
   return KernelUsageIndex(
     root=kernel_root,
@@ -288,11 +309,13 @@ def _resolve_yaml_source(
 def _kernel_record(name: str, kernel_root: Path, source_path: Path | None) -> KernelRecord:
   source = _source_relative_to_root(kernel_root, source_path) if source_path else None
   source_stem = source_path.stem if source_path is not None else ""
+  usage = _extract_source_usage(source_path) if source_path is not None else KernelUsage()
   return KernelRecord(
     name=name,
     source=source,
     category=_source_category(kernel_root, source_path),
     dtype_hints=_dtype_hints(name, source_stem),
+    usage=usage,
   )
 
 
@@ -312,3 +335,156 @@ def _source_category(kernel_root: Path, source_path: Path | None) -> str:
 def _dtype_hints(name: str, source_stem: str) -> list[str]:
   haystack = f"{name} {source_stem}".lower()
   return [token for token in DTYPE_TOKENS if token in haystack]
+
+
+def _extract_source_usage(source_path: Path) -> KernelUsage:
+  text = source_path.read_text(encoding="utf-8", errors="ignore")
+  stripped = _strip_comments_for_token_scan(text)
+  intrinsics = _extract_intrinsics(stripped)
+  return KernelUsage(
+    dma_calls=_extract_dma_calls(stripped),
+    sync_calls=_extract_sync_calls(stripped),
+    memory_spaces=[
+      space for space in MEMORY_SPACES if re.search(rf"\b{space}\b", stripped)
+    ],
+    vector_types=sorted(set(VECTOR_TYPE_RE.findall(stripped))),
+    intrinsics=intrinsics,
+    constants=sorted({int(match.group(0)) for match in INTEGER_RE.finditer(stripped)}),
+  )
+
+
+def _extract_dma_calls(text: str) -> list[DmaCall]:
+  calls = []
+  for line, args_text in _find_balanced_calls(text, "dlc_dma"):
+    args = _split_call_args(args_text)
+    if len(args) != 9:
+      continue
+    calls.append(
+      DmaCall(
+        line=line,
+        src_addr=args[0],
+        src_space=args[1],
+        dst_addr=args[2],
+        dst_space=args[3],
+        length=args[4],
+        src_stride=args[5],
+        dst_stride=args[6],
+        unit_len=args[7],
+        addr_exp=args[8],
+      )
+    )
+  return calls
+
+
+def _extract_sync_calls(text: str) -> list[SyncCall]:
+  calls = []
+  for line, args_text in _find_balanced_calls(text, "dlc_sync"):
+    args = _split_call_args(args_text)
+    if not args:
+      continue
+    calls.append(SyncCall(line=line, handle=args[0]))
+  return calls
+
+
+def _extract_intrinsics(text: str) -> list[str]:
+  names = set()
+  for match in CALL_TOKEN_RE.finditer(text):
+    name = match.group(1)
+    if name in CONTROL_CALLS:
+      continue
+    if _is_intrinsic_name(name):
+      names.add(name)
+  return sorted(names)
+
+
+def _is_intrinsic_name(name: str) -> bool:
+  return (
+    name.startswith("v_")
+    or name.startswith("__dlc_")
+    or name.startswith("m_")
+    or name.startswith("gstf")
+    or name.startswith("gsnf")
+    or name == "pre_exp2"
+    or "ldmask" in name
+    or "msk" in name
+    or "mask" in name
+    or (name.startswith("load") and "mask" in name)
+  )
+
+
+def _strip_comments_for_token_scan(text: str) -> str:
+  chars: list[str] = []
+  index = 0
+  while index < len(text):
+    if text.startswith("//", index):
+      chars.extend("  ")
+      index += 2
+      while index < len(text) and text[index] != "\n":
+        chars.append(" ")
+        index += 1
+      continue
+    if text.startswith("/*", index):
+      chars.extend("  ")
+      index += 2
+      while index < len(text) and not text.startswith("*/", index):
+        chars.append("\n" if text[index] == "\n" else " ")
+        index += 1
+      if index < len(text):
+        chars.extend("  ")
+        index += 2
+      continue
+    chars.append(text[index])
+    index += 1
+  return "".join(chars)
+
+
+def _find_balanced_calls(text: str, name: str) -> list[tuple[int, str]]:
+  pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}\s*\(")
+  calls = []
+  for match in pattern.finditer(text):
+    open_index = match.end() - 1
+    depth = 0
+    for index in range(open_index, len(text)):
+      char = text[index]
+      if char == "(":
+        depth += 1
+      elif char == ")":
+        depth -= 1
+        if depth == 0:
+          line = text.count("\n", 0, match.start()) + 1
+          calls.append((line, text[open_index + 1 : index].strip()))
+          break
+  return calls
+
+
+def _split_call_args(args: str) -> list[str]:
+  if not args.strip():
+    return []
+  result = []
+  start = 0
+  paren_depth = 0
+  bracket_depth = 0
+  brace_depth = 0
+  for index, char in enumerate(args):
+    if char == "(":
+      paren_depth += 1
+    elif char == ")":
+      paren_depth = max(paren_depth - 1, 0)
+    elif char == "[":
+      bracket_depth += 1
+    elif char == "]":
+      bracket_depth = max(bracket_depth - 1, 0)
+    elif char == "{":
+      brace_depth += 1
+    elif char == "}":
+      brace_depth = max(brace_depth - 1, 0)
+    elif (
+      char == ","
+      and paren_depth == 0
+      and bracket_depth == 0
+      and brace_depth == 0
+    ):
+      result.append(args[start:index].strip())
+      start = index + 1
+  result.append(args[start:].strip())
+  return result

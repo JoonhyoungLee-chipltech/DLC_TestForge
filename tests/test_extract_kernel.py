@@ -308,3 +308,121 @@ def test_write_kernel_usage_index_writes_schema_json(tmp_path):
   assert data["schema_version"] == 1
   assert data["summary"]["kernel_count"] == 1
   assert data["kernels"][0]["name"] == "alpha"
+
+
+def test_extracts_multiline_dma_sync_and_source_tokens(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_kernels" / "dma_kernel.c",
+    """inline void copy_kernel(tensor hbm_src, tensor vmem_dst, int src_addr, int dst_addr, int length) {
+  int handle = dlc_dma(tensor_slice(hbm_src, src_addr / 32), HBM,
+                       tensor_slice(vmem_dst, dst_addr / 32), VMEM,
+                       length, 128, 128, 128, 7);
+  dlc_sync(handle);
+  int mask = pre_exp2(length / 128);
+  float8_128 x = v_f32_ld_tnsr_st_msk(dst_addr / 32, vmem_dst, 1, mask);
+  int8_128 y = __dlc_abs(x);
+  bool8_128 z = m_f32_perm(x, y, 0, 0);
+}
+""",
+  )
+
+  index = build_kernel_usage_index(kernel_root)
+  record = index.kernels[0]
+  usage = record.usage
+
+  assert index.summary.dma_call_count == 1
+  assert index.summary.sync_call_count == 1
+  assert index.summary.vector_usage_count == (
+    len(usage.vector_types) + len(usage.intrinsics)
+  )
+  assert usage.dma_calls[0].to_dict() == {
+    "line": 2,
+    "src_addr": "tensor_slice(hbm_src, src_addr / 32)",
+    "src_space": "HBM",
+    "dst_addr": "tensor_slice(vmem_dst, dst_addr / 32)",
+    "dst_space": "VMEM",
+    "length": "length",
+    "src_stride": "128",
+    "dst_stride": "128",
+    "unit_len": "128",
+    "addr_exp": "7",
+  }
+  assert usage.sync_calls[0].to_dict() == {"line": 5, "handle": "handle"}
+  assert usage.memory_spaces == ["HBM", "VMEM"]
+  assert usage.vector_types == ["bool8_128", "float8_128", "int8_128"]
+  assert usage.intrinsics == [
+    "__dlc_abs",
+    "m_f32_perm",
+    "pre_exp2",
+    "v_f32_ld_tnsr_st_msk",
+  ]
+  assert usage.constants == [0, 1, 7, 32, 128]
+
+
+def test_extracts_multiple_dma_calls_and_skips_invalid_arity(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_kernels" / "multi_dma.c",
+    """void f(tensor h, tensor v) {
+  int a = dlc_dma(h, HBM, v, VMEM, 128, 128, 128, 128, 7);
+  int bad = dlc_dma(h, HBM);
+  int b = dlc_dma(v, VMEM, h, HBM, 256, 128, 128, 128, 7);
+  dlc_sync(a);
+  dlc_sync(b);
+}
+""",
+  )
+
+  index = build_kernel_usage_index(kernel_root)
+  usage = index.kernels[0].usage
+
+  assert index.summary.dma_call_count == 2
+  assert index.summary.sync_call_count == 2
+  assert [call.length for call in usage.dma_calls] == ["128", "256"]
+  assert [call.handle for call in usage.sync_calls] == ["a", "b"]
+
+
+def test_source_usage_ignores_comment_only_tokens(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_kernels" / "comments.c",
+    """void f(tensor h, tensor v) {
+  // dlc_dma(h, HBM, v, VMEM, 1024, 128, 128, 128, 7);
+  /* dlc_sync(fake);
+     float8_128 hidden = v_f32_ld_tnsr_st_msk(0, v, 1, 1);
+     CMEM SMEM -9
+  */
+  int real_value = -3;
+}
+""",
+  )
+
+  index = build_kernel_usage_index(kernel_root)
+  usage = index.kernels[0].usage
+
+  assert usage.dma_calls == []
+  assert usage.sync_calls == []
+  assert usage.memory_spaces == []
+  assert usage.vector_types == []
+  assert usage.intrinsics == []
+  assert usage.constants == [-3]
+
+
+def test_missing_yaml_source_keeps_empty_usage(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_src" / "kernel_info.yaml",
+    "- name: custom_missing\n  src: missing\n",
+  )
+  (kernel_root / "dlc_kernels").mkdir(parents=True)
+
+  index = build_kernel_usage_index(kernel_root)
+  usage = index.kernels[0].usage
+
+  assert usage.dma_calls == []
+  assert usage.sync_calls == []
+  assert usage.memory_spaces == []
+  assert usage.vector_types == []
+  assert usage.intrinsics == []
+  assert usage.constants == []
