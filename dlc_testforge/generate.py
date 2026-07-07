@@ -14,6 +14,7 @@ from dlc_testforge.agent import (
   filter_agent_mutations,
   load_agent_proposal,
   request_agent_proposal,
+  select_kernel_evidence,
   write_agent_json,
 )
 from dlc_testforge.extract_spec import build_spec_index, write_spec_index
@@ -104,6 +105,7 @@ def create_workspace(
   agent_proposal: Path | None = None,
   agent_model: str | None = None,
   agent_endpoint: str | None = None,
+  kernel_usage_index: Path | None = None,
 ) -> WorkspaceManifest:
   if max_candidates < 1:
     raise ValueError("max-candidates must be at least 1")
@@ -140,6 +142,21 @@ def create_workspace(
     raise ValueError(f"profile {profile.name} has no source path")
   shutil.copyfile(profile.path, profile_input_path)
 
+  kernel_usage_input_path = None
+  selected_kernel_evidence = None
+  if kernel_usage_index is not None:
+    kernel_usage_index_path = kernel_usage_index.expanduser().resolve(strict=False)
+    kernel_usage_data = json.loads(
+      kernel_usage_index_path.read_text(encoding="utf-8")
+    )
+    kernel_usage_input_path = inputs_dir / "kernel-usage-index.json"
+    shutil.copyfile(kernel_usage_index_path, kernel_usage_input_path)
+    selected_kernel_evidence = select_kernel_evidence(
+      kernel_usage_data,
+      profile.name,
+      seed_relative,
+    )
+
   test_index = build_index(llvm_root)
   spec_index = build_spec_index(llvm_root)
   td_index = build_td_index(llvm_root)
@@ -158,6 +175,7 @@ def create_workspace(
       test_index=test_index.to_dict(),
       spec_index=spec_index.to_dict(),
       td_index=td_index.to_dict(),
+      kernel_usage_evidence=selected_kernel_evidence,
     )
     write_agent_json(inputs_dir / "agent-context.json", context)
 
@@ -219,6 +237,11 @@ def create_workspace(
       "test_index": "inputs/test-index.json",
       "spec_index": "inputs/spec-index.json",
       "td_index": "inputs/td-index.json",
+      **(
+        {"kernel_usage_index": "inputs/kernel-usage-index.json"}
+        if kernel_usage_input_path is not None
+        else {}
+      ),
       **({"agent_context": "inputs/agent-context.json"} if mode == "agent" else {}),
       **(
         {"agent_proposal": "inputs/agent-proposal.json"}

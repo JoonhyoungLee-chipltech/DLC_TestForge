@@ -173,6 +173,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
       agent_proposal=args.agent_proposal,
       agent_model=args.agent_model,
       agent_endpoint=args.agent_endpoint,
+      kernel_usage_index=args.kernel_usage_index,
     )
   except OSError as exc:
     print(f"error: {exc}", file=sys.stderr)
@@ -414,6 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
     "--agent-endpoint",
     default=None,
     help="OpenAI-compatible API endpoint for agent mode.",
+  )
+  generate_parser.add_argument(
+    "--kernel-usage-index",
+    type=Path,
+    default=None,
+    help="Optional kernel usage index JSON produced by extract-kernel.",
   )
   generate_parser.set_defaults(func=cmd_generate)
 

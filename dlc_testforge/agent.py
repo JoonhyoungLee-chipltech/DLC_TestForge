@@ -99,9 +99,22 @@ def build_agent_context(
   test_index: dict[str, Any] | None = None,
   spec_index: dict[str, Any] | None = None,
   td_index: dict[str, Any] | None = None,
+  kernel_usage_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
   seed_record = _find_seed_record(test_index, seed_relative)
-  return {
+  guardrails = [
+    "Use the exact seed and profile from this context.",
+    "Only propose immediate-value mutations supported by profile.mutation_axes.immediates.values.",
+    "Use edits when one candidate must change multiple related immediate occurrences together.",
+    "Do not change RUN lines.",
+    "Do not invent DLC instructions or intrinsics.",
+    "Each edit must change one old_value to one new_value.",
+  ]
+  if kernel_usage_evidence is not None:
+    guardrails.append(
+      "Treat kernel usage evidence as workload evidence, not permission to invent unsupported IR mutations."
+    )
+  context = {
     "task": "propose_dlc_test_mutations",
     "contract": {
       "role": "propose mutation ideas only",
@@ -128,15 +141,11 @@ def build_agent_context(
     "source_records": _select_source_records(td_index, profile.source_files),
     "td_summary": (td_index or {}).get("summary", {}),
     "mutation_budget": max_candidates,
-    "guardrails": [
-      "Use the exact seed and profile from this context.",
-      "Only propose immediate-value mutations supported by profile.mutation_axes.immediates.values.",
-      "Use edits when one candidate must change multiple related immediate occurrences together.",
-      "Do not change RUN lines.",
-      "Do not invent DLC instructions or intrinsics.",
-      "Each edit must change one old_value to one new_value.",
-    ],
+    "guardrails": guardrails,
   }
+  if kernel_usage_evidence is not None:
+    context["kernel_usage_evidence"] = kernel_usage_evidence
+  return context
 
 
 def select_kernel_evidence(

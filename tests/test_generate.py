@@ -59,6 +59,54 @@ bug_scout:
   return profiles_dir
 
 
+def _write_kernel_usage_index(tmp_path):
+  path = tmp_path / "kernel-usage-index.json"
+  path.write_text(
+    json.dumps(
+      {
+        "schema_version": 1,
+        "summary": {"kernel_count": 1},
+        "kernels": [
+          {
+            "name": "custom_edge",
+            "source": "dlc_kernels/custom_edge.c",
+            "category": "root",
+            "dtype_hints": ["f32"],
+            "features": [],
+            "usage": {
+              "dma_calls": [{"line": 3}],
+              "memory_spaces": ["HBM", "VMEM"],
+              "vector_types": ["float8_128"],
+              "intrinsics": ["v_f32_ld_tnsr_st_msk"],
+              "constants": [7, 128],
+              "relations": [
+                {
+                  "kind": "address_exponent",
+                  "line": 3,
+                  "evidence": "addr_exp=7",
+                  "reason": "test",
+                }
+              ],
+            },
+            "edge_hints": [
+              {
+                "kind": "addr_exp_boundary",
+                "base": 7,
+                "values": [6, 7, 8],
+                "source": "dlc_kernels/custom_edge.c:3",
+                "reason": "test",
+              }
+            ],
+          }
+        ],
+        "global_edge_hints": [],
+      }
+    ),
+    encoding="utf-8",
+  )
+  return path
+
+
 def test_dry_run_creates_workspace_snapshots_and_no_candidates(tmp_path):
   llvm_root = _make_llvm_root(tmp_path)
   profiles_dir = _make_profiles_dir(tmp_path)
@@ -426,6 +474,12 @@ def test_agent_mode_uses_proposal_file_and_records_rejections(tmp_path):
   assert "mode=agent axis=shift_amount_boundary edits=7->6" in candidate_text
   assert "%shl = shl i32 %x, 6" in candidate_text
   assert manifest.candidates[0].rationale == "exercise the adjacent lower shift boundary"
+  context = json.loads(
+    (tmp_path / "workspace" / "inputs" / "agent-context.json").read_text(
+      encoding="utf-8"
+    )
+  )
+  assert "kernel_usage_evidence" not in context
 
   rejections = json.loads(
     (tmp_path / "workspace" / "results" / "agent-rejections.json").read_text(
@@ -541,6 +595,139 @@ def test_cli_generate_agent_mode_outputs_json(tmp_path, capsys):
   assert result["candidate_count"] == 1
   assert (out_dir / "inputs" / "agent-context.json").is_file()
   assert (out_dir / "results" / "agent-rejections.json").is_file()
+
+
+def test_agent_mode_includes_kernel_usage_evidence_when_provided(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  kernel_usage_index = _write_kernel_usage_index(tmp_path)
+  out_dir = tmp_path / "workspace"
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    out_dir,
+    dry_run=True,
+    profiles_dir=profiles_dir,
+    mode="agent",
+    kernel_usage_index=kernel_usage_index,
+  )
+
+  assert manifest.inputs["kernel_usage_index"] == "inputs/kernel-usage-index.json"
+  assert (out_dir / "inputs" / "kernel-usage-index.json").is_file()
+  context = json.loads(
+    (out_dir / "inputs" / "agent-context.json").read_text(encoding="utf-8")
+  )
+  assert context["kernel_usage_evidence"]["selection"]["selected_count"] == 1
+  assert context["kernel_usage_evidence"]["kernels"][0]["name"] == "custom_edge"
+
+
+def test_manual_mode_copies_kernel_usage_index_without_agent_context(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  kernel_usage_index = _write_kernel_usage_index(tmp_path)
+  out_dir = tmp_path / "workspace"
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    out_dir,
+    dry_run=True,
+    profiles_dir=profiles_dir,
+    kernel_usage_index=kernel_usage_index,
+  )
+
+  assert manifest.inputs["kernel_usage_index"] == "inputs/kernel-usage-index.json"
+  assert (out_dir / "inputs" / "kernel-usage-index.json").is_file()
+  assert not (out_dir / "inputs" / "agent-context.json").exists()
+
+
+def test_cli_generate_accepts_kernel_usage_index(tmp_path, capsys):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  kernel_usage_index = _write_kernel_usage_index(tmp_path)
+  out_dir = tmp_path / "workspace"
+
+  assert (
+    main(
+      [
+        "generate",
+        "--llvm-root",
+        str(llvm_root),
+        "--profile",
+        "example",
+        "--seed",
+        "llvm/test/CodeGen/DLC/example.ll",
+        "--out-dir",
+        str(out_dir),
+        "--profiles-dir",
+        str(profiles_dir),
+        "--dry-run",
+        "--kernel-usage-index",
+        str(kernel_usage_index),
+      ]
+    )
+    == 0
+  )
+
+  json.loads(capsys.readouterr().out)
+  manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+  assert manifest["inputs"]["kernel_usage_index"] == "inputs/kernel-usage-index.json"
+
+
+def test_invalid_kernel_usage_index_json_fails(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  bad_index = tmp_path / "bad-kernel-index.json"
+  bad_index.write_text("{not json\n", encoding="utf-8")
+
+  try:
+    create_workspace(
+      llvm_root,
+      "example",
+      "llvm/test/CodeGen/DLC/example.ll",
+      tmp_path / "workspace",
+      dry_run=True,
+      profiles_dir=profiles_dir,
+      kernel_usage_index=bad_index,
+    )
+  except ValueError as exc:
+    assert "Expecting property name" in str(exc)
+  else:
+    raise AssertionError("expected ValueError")
+
+
+def test_cli_generate_invalid_kernel_usage_index_json_exits_nonzero(tmp_path, capsys):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  bad_index = tmp_path / "bad-kernel-index.json"
+  bad_index.write_text("{not json\n", encoding="utf-8")
+
+  assert (
+    main(
+      [
+        "generate",
+        "--llvm-root",
+        str(llvm_root),
+        "--profile",
+        "example",
+        "--seed",
+        "llvm/test/CodeGen/DLC/example.ll",
+        "--out-dir",
+        str(tmp_path / "workspace"),
+        "--profiles-dir",
+        str(profiles_dir),
+        "--dry-run",
+        "--kernel-usage-index",
+        str(bad_index),
+      ]
+    )
+    == 2
+  )
+
+  assert "error:" in capsys.readouterr().err
 
 
 def test_agent_mode_without_proposal_requires_model(tmp_path, monkeypatch):

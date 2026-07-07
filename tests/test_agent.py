@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from dlc_testforge.agent import (
+  build_agent_context,
   filter_agent_mutations,
   parse_agent_proposal,
   request_agent_proposal,
@@ -460,3 +461,30 @@ def test_select_kernel_evidence_prunes_records_and_caps_global_edges():
   assert len(record["usage"]["relations"]) == 8
   assert len(record["edge_hints"]) == 2
   assert len(selected["global_edge_hints"]) == 20
+
+
+def test_build_agent_context_optionally_includes_kernel_usage_evidence(tmp_path):
+  profiles_dir = _make_profiles_dir(tmp_path)
+  profile = get_profile("example", profiles_dir)
+  evidence = {
+    "selection": {"selected_count": 1},
+    "kernels": [{"name": "custom_kernel"}],
+  }
+
+  base_context = build_agent_context(
+    profile,
+    "llvm/test/CodeGen/DLC/example.ll",
+    "define void @example() { ret void }\n",
+    3,
+  )
+  context = build_agent_context(
+    profile,
+    "llvm/test/CodeGen/DLC/example.ll",
+    "define void @example() { ret void }\n",
+    3,
+    kernel_usage_evidence=evidence,
+  )
+
+  assert "kernel_usage_evidence" not in base_context
+  assert context["kernel_usage_evidence"] == evidence
+  assert any("kernel usage evidence" in guardrail for guardrail in context["guardrails"])
