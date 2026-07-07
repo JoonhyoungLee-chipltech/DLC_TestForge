@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import yaml
+
+
+SUPPORTED_SOURCE_SUFFIXES = [".c", ".cpp", ".h", ".hpp"]
+DERIVED_KERNEL_SUFFIXES = {".c", ".cpp"}
+DTYPE_TOKENS = ["bf16", "f32", "i32", "i64", "int8", "long"]
 
 
 @dataclass(frozen=True)
@@ -160,3 +168,147 @@ class KernelUsageIndex:
       "kernels": [kernel.to_dict() for kernel in self.kernels],
       "global_edge_hints": [hint.to_dict() for hint in self.global_edge_hints],
     }
+
+
+def build_kernel_usage_index(kernel_root: Path) -> KernelUsageIndex:
+  kernel_root = kernel_root.expanduser().resolve(strict=False)
+  if not kernel_root.is_dir():
+    raise ValueError(f"kernel root not found: {kernel_root}")
+
+  source_root = kernel_root / "dlc_kernels"
+  if not source_root.is_dir():
+    raise ValueError(f"dlc_kernels directory not found: {source_root}")
+
+  source_files = _discover_source_files(source_root)
+  source_by_stem = _source_files_by_stem(source_files)
+  kernels: list[KernelRecord] = []
+  referenced_sources: set[Path] = set()
+
+  yaml_entries = _load_yaml_entries(kernel_root / "dlc_src" / "kernel_info.yaml")
+  for entry in yaml_entries:
+    name = entry["name"]
+    source_path = _resolve_yaml_source(source_root, source_by_stem, entry.get("src"))
+    if source_path is not None:
+      referenced_sources.add(source_path)
+    kernels.append(_kernel_record(name, kernel_root, source_path))
+
+  for source_path in source_files:
+    if source_path in referenced_sources:
+      continue
+    if source_path.suffix not in DERIVED_KERNEL_SUFFIXES:
+      continue
+    kernels.append(_kernel_record(source_path.stem, kernel_root, source_path))
+
+  kernels.sort(key=lambda kernel: (kernel.name.lower(), kernel.source or ""))
+  summary = KernelUsageSummary(
+    kernel_count=len(kernels),
+    source_file_count=len(source_files),
+    syntest_file_count=0,
+  )
+  return KernelUsageIndex(
+    root=kernel_root,
+    summary=summary,
+    kernels=kernels,
+  )
+
+
+def write_kernel_usage_index(index: KernelUsageIndex, out: Path) -> None:
+  out.parent.mkdir(parents=True, exist_ok=True)
+  out.write_text(
+    json.dumps(index.to_dict(), indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+  )
+
+
+def _discover_source_files(source_root: Path) -> list[Path]:
+  files = [
+    path
+    for path in source_root.rglob("*")
+    if path.is_file() and path.suffix in SUPPORTED_SOURCE_SUFFIXES
+  ]
+  return sorted(files, key=lambda path: path.relative_to(source_root).as_posix())
+
+
+def _source_files_by_stem(source_files: list[Path]) -> dict[str, list[Path]]:
+  by_stem: dict[str, list[Path]] = {}
+  for path in source_files:
+    by_stem.setdefault(path.stem, []).append(path)
+  for matches in by_stem.values():
+    matches.sort(key=lambda path: path.as_posix())
+  return by_stem
+
+
+def _load_yaml_entries(path: Path) -> list[dict[str, Any]]:
+  if not path.is_file():
+    return []
+  data = yaml.safe_load(path.read_text(encoding="utf-8"))
+  if data is None:
+    return []
+  if not isinstance(data, list):
+    raise ValueError(f"kernel_info.yaml must contain a list: {path}")
+
+  entries: list[dict[str, Any]] = []
+  for index, item in enumerate(data):
+    if not isinstance(item, dict):
+      raise ValueError(f"kernel_info.yaml entry {index} must be a mapping")
+    name = item.get("name")
+    if not isinstance(name, str) or not name.strip():
+      raise ValueError(f"kernel_info.yaml entry {index} must have a non-empty name")
+    entry = dict(item)
+    entry["name"] = name.strip()
+    entries.append(entry)
+  return entries
+
+
+def _resolve_yaml_source(
+  source_root: Path,
+  source_by_stem: dict[str, list[Path]],
+  src: Any,
+) -> Path | None:
+  if not isinstance(src, str) or not src.strip():
+    return None
+  src_name = src.strip()
+  src_path = Path(src_name)
+  if src_path.suffix in SUPPORTED_SOURCE_SUFFIXES:
+    direct = source_root / src_path
+    if direct.is_file():
+      return direct
+    matches = source_by_stem.get(src_path.stem, [])
+    return matches[0] if matches else None
+
+  for suffix in SUPPORTED_SOURCE_SUFFIXES:
+    direct = source_root / f"{src_name}{suffix}"
+    if direct.is_file():
+      return direct
+
+  matches = source_by_stem.get(src_name, [])
+  return matches[0] if matches else None
+
+
+def _kernel_record(name: str, kernel_root: Path, source_path: Path | None) -> KernelRecord:
+  source = _source_relative_to_root(kernel_root, source_path) if source_path else None
+  source_stem = source_path.stem if source_path is not None else ""
+  return KernelRecord(
+    name=name,
+    source=source,
+    category=_source_category(kernel_root, source_path),
+    dtype_hints=_dtype_hints(name, source_stem),
+  )
+
+
+def _source_relative_to_root(kernel_root: Path, source_path: Path) -> str:
+  return source_path.relative_to(kernel_root).as_posix()
+
+
+def _source_category(kernel_root: Path, source_path: Path | None) -> str:
+  if source_path is None:
+    return "unknown"
+  relative_parts = source_path.relative_to(kernel_root / "dlc_kernels").parts
+  if len(relative_parts) <= 1:
+    return "root"
+  return relative_parts[0]
+
+
+def _dtype_hints(name: str, source_stem: str) -> list[str]:
+  haystack = f"{name} {source_stem}".lower()
+  return [token for token in DTYPE_TOKENS if token in haystack]

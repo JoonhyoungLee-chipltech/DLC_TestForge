@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from dlc_testforge.extract_kernel import (
   DmaCall,
   EdgeHint,
@@ -9,7 +11,14 @@ from dlc_testforge.extract_kernel import (
   KernelUsageSummary,
   RelationHint,
   SyncCall,
+  build_kernel_usage_index,
+  write_kernel_usage_index,
 )
+
+
+def _write(path, text=""):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(text, encoding="utf-8")
 
 
 def test_empty_kernel_usage_index_shape(tmp_path):
@@ -186,3 +195,116 @@ def test_kernel_usage_summary_contains_all_count_fields():
     "vector_usage_count": 7,
     "edge_hint_count": 8,
   }
+
+
+def test_build_kernel_usage_index_resolves_yaml_direct_source(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_src" / "kernel_info.yaml",
+    "- name: custom_top_f32\n  src: top_kernel\n",
+  )
+  _write(kernel_root / "dlc_kernels" / "top_kernel.c")
+
+  index = build_kernel_usage_index(kernel_root)
+  records = {record.name: record for record in index.kernels}
+
+  assert index.summary.kernel_count == 1
+  assert index.summary.source_file_count == 1
+  assert records["custom_top_f32"].source == "dlc_kernels/top_kernel.c"
+  assert records["custom_top_f32"].category == "root"
+  assert records["custom_top_f32"].dtype_hints == ["f32"]
+
+
+def test_build_kernel_usage_index_resolves_yaml_recursive_source(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_src" / "kernel_info.yaml",
+    "- name: Custom_layer_norm_bf16\n  src: layer_norm_bf16\n",
+  )
+  _write(kernel_root / "dlc_kernels" / "norm" / "layer_norm" / "layer_norm_bf16.cpp")
+
+  index = build_kernel_usage_index(kernel_root)
+  record = index.kernels[0]
+
+  assert record.name == "Custom_layer_norm_bf16"
+  assert record.source == "dlc_kernels/norm/layer_norm/layer_norm_bf16.cpp"
+  assert record.category == "norm"
+  assert record.dtype_hints == ["bf16"]
+
+
+def test_build_kernel_usage_index_derives_records_when_yaml_is_missing(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(kernel_root / "dlc_kernels" / "alpha_i32.c")
+  _write(kernel_root / "dlc_kernels" / "norm" / "beta_long.cpp")
+
+  index = build_kernel_usage_index(kernel_root)
+  records = {record.name: record for record in index.kernels}
+
+  assert index.summary.kernel_count == 2
+  assert index.summary.source_file_count == 2
+  assert records["alpha_i32"].source == "dlc_kernels/alpha_i32.c"
+  assert records["alpha_i32"].category == "root"
+  assert records["alpha_i32"].dtype_hints == ["i32"]
+  assert records["beta_long"].source == "dlc_kernels/norm/beta_long.cpp"
+  assert records["beta_long"].category == "norm"
+  assert records["beta_long"].dtype_hints == ["long"]
+
+
+def test_unreferenced_headers_are_counted_but_not_kernel_records(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(kernel_root / "dlc_kernels" / "helper.hpp")
+  _write(kernel_root / "dlc_kernels" / "gamma_int8.c")
+
+  index = build_kernel_usage_index(kernel_root)
+
+  assert index.summary.source_file_count == 2
+  assert [record.name for record in index.kernels] == ["gamma_int8"]
+  assert index.kernels[0].dtype_hints == ["int8"]
+
+
+def test_missing_yaml_source_keeps_kernel_record(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_src" / "kernel_info.yaml",
+    "- name: custom_missing_i64\n  src: missing_source\n",
+  )
+  (kernel_root / "dlc_kernels").mkdir(parents=True)
+
+  index = build_kernel_usage_index(kernel_root)
+  record = index.kernels[0]
+
+  assert record.name == "custom_missing_i64"
+  assert record.source is None
+  assert record.category == "unknown"
+  assert record.dtype_hints == ["i64"]
+
+
+def test_referenced_header_can_be_kernel_record(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(
+    kernel_root / "dlc_src" / "kernel_info.yaml",
+    "- name: custom_header_bf16\n  src: header_kernel\n",
+  )
+  _write(kernel_root / "dlc_kernels" / "headers" / "header_kernel.h")
+
+  index = build_kernel_usage_index(kernel_root)
+  record = index.kernels[0]
+
+  assert record.name == "custom_header_bf16"
+  assert record.source == "dlc_kernels/headers/header_kernel.h"
+  assert record.category == "headers"
+  assert record.dtype_hints == ["bf16"]
+
+
+def test_write_kernel_usage_index_writes_schema_json(tmp_path):
+  kernel_root = tmp_path / "DLC_Custom_Kernel"
+  _write(kernel_root / "dlc_kernels" / "alpha.c")
+  index = build_kernel_usage_index(kernel_root)
+  out = tmp_path / "out" / "kernel-index.json"
+
+  write_kernel_usage_index(index, out)
+
+  data = json.loads(out.read_text(encoding="utf-8"))
+  assert data["schema_version"] == 1
+  assert data["summary"]["kernel_count"] == 1
+  assert data["kernels"][0]["name"] == "alpha"
