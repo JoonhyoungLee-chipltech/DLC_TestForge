@@ -431,6 +431,10 @@ def test_agent_mode_uses_proposal_file_and_records_rejections(tmp_path):
             "old_value": 7,
             "new_value": 6,
             "rationale": "exercise the adjacent lower shift boundary",
+            "evidence_tags": ["addr_exp_boundary", "dma_length_boundary"],
+            "source_evidence": (
+              "selected kernel evidence points at address boundary behavior"
+            ),
           },
           {
             "axis": "shift_amount_boundary",
@@ -474,6 +478,20 @@ def test_agent_mode_uses_proposal_file_and_records_rejections(tmp_path):
   assert "mode=agent axis=shift_amount_boundary edits=7->6" in candidate_text
   assert "%shl = shl i32 %x, 6" in candidate_text
   assert manifest.candidates[0].rationale == "exercise the adjacent lower shift boundary"
+  agent_proposal = json.loads(
+    (tmp_path / "workspace" / "inputs" / "agent-proposal.json").read_text(
+      encoding="utf-8"
+    )
+  )
+  saved_mutation = agent_proposal["proposed_mutations"][0]
+  assert saved_mutation["evidence_tags"] == [
+    "addr_exp_boundary",
+    "dma_length_boundary",
+  ]
+  assert (
+    saved_mutation["source_evidence"]
+    == "selected kernel evidence points at address boundary behavior"
+  )
   context = json.loads(
     (tmp_path / "workspace" / "inputs" / "agent-context.json").read_text(
       encoding="utf-8"

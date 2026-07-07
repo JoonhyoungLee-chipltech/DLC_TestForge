@@ -39,6 +39,8 @@ class AgentMutationProposal:
   location_hint: str
   edits: list[AgentMutationEdit]
   rationale: str
+  evidence_tags: list[str] | None = None
+  source_evidence: str | None = None
 
   @property
   def old_value(self) -> int:
@@ -57,6 +59,10 @@ class AgentMutationProposal:
       "edits": [edit.to_dict() for edit in self.edits],
       "rationale": self.rationale,
     }
+    if self.evidence_tags:
+      data["evidence_tags"] = self.evidence_tags
+    if self.source_evidence:
+      data["source_evidence"] = self.source_evidence
     return data
 
 
@@ -129,6 +135,10 @@ def build_agent_context(
         "location_hint",
         "edits",
         "rationale",
+      ],
+      "optional_mutation_fields": [
+        "evidence_tags",
+        "source_evidence",
       ],
     },
     "seed": {
@@ -261,7 +271,9 @@ def request_agent_proposal(
           "You propose DLC LLVM test mutations. Return only one JSON object. "
           "Do not include Markdown fences, prose, comments, or extra top-level keys. "
           "The object must have exactly these top-level fields: seed, profile, "
-          "proposed_mutations. The seed and profile fields must be strings."
+          "proposed_mutations. The seed and profile fields must be strings. "
+          "Mutation evidence_tags and source_evidence are optional metadata only; "
+          "they do not permit unsupported mutation axes, values, IR, or intrinsics."
         ),
       },
       {
@@ -288,6 +300,10 @@ def request_agent_proposal(
                       }
                     ],
                     "rationale": "why this edge case is worth trying",
+                    "evidence_tags": ["addr_exp_boundary"],
+                    "source_evidence": (
+                      "kernel usage evidence includes address exponent boundary hints"
+                    ),
                   }
                 ],
               },
@@ -521,12 +537,39 @@ def _parse_mutation(index: int, item: Any) -> AgentMutationProposal:
   if not isinstance(rationale, str) or not rationale:
     raise ValueError(f"proposed_mutations[{index}].rationale must be a non-empty string")
   edits = _parse_mutation_edits(index, item)
+  evidence_tags = _parse_evidence_tags(index, item.get("evidence_tags"))
+  source_evidence = _parse_source_evidence(index, item.get("source_evidence"))
   return AgentMutationProposal(
     axis=axis,
     location_hint=location_hint,
     edits=edits,
     rationale=rationale,
+    evidence_tags=evidence_tags,
+    source_evidence=source_evidence,
   )
+
+
+def _parse_evidence_tags(index: int, value: Any) -> list[str] | None:
+  if value is None:
+    return None
+  if not isinstance(value, list):
+    raise ValueError(
+      f"proposed_mutations[{index}].evidence_tags must be a list of strings"
+    )
+  for tag_index, tag in enumerate(value):
+    if not isinstance(tag, str):
+      raise ValueError(
+        f"proposed_mutations[{index}].evidence_tags[{tag_index}] must be a string"
+      )
+  return value or None
+
+
+def _parse_source_evidence(index: int, value: Any) -> str | None:
+  if value is None:
+    return None
+  if not isinstance(value, str):
+    raise ValueError(f"proposed_mutations[{index}].source_evidence must be a string")
+  return value or None
 
 
 def _parse_mutation_edits(index: int, item: dict[str, Any]) -> list[AgentMutationEdit]:

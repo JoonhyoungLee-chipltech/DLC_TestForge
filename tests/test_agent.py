@@ -116,6 +116,78 @@ def test_parse_agent_proposal_accepts_grouped_edits():
   ]
 
 
+def test_parse_agent_proposal_preserves_optional_evidence_metadata():
+  proposal = parse_agent_proposal(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "proposed_mutations": [
+          {
+            "axis": "shift_amount_boundary",
+            "location_hint": "@example",
+            "old_value": 7,
+            "new_value": 6,
+            "rationale": "exercise a kernel-informed boundary",
+            "evidence_tags": ["addr_exp_boundary", "dma_length_boundary"],
+            "source_evidence": (
+              "selected kernel evidence has address and DMA boundary hints"
+            ),
+          }
+        ],
+      }
+    )
+  )
+
+  mutation = proposal.proposed_mutations[0]
+  assert mutation.evidence_tags == ["addr_exp_boundary", "dma_length_boundary"]
+  assert (
+    mutation.source_evidence
+    == "selected kernel evidence has address and DMA boundary hints"
+  )
+  assert mutation.to_dict()["evidence_tags"] == [
+    "addr_exp_boundary",
+    "dma_length_boundary",
+  ]
+  assert (
+    mutation.to_dict()["source_evidence"]
+    == "selected kernel evidence has address and DMA boundary hints"
+  )
+
+
+def test_parse_agent_proposal_rejects_malformed_evidence_metadata():
+  base_mutation = {
+    "axis": "shift_amount_boundary",
+    "location_hint": "@example",
+    "old_value": 7,
+    "new_value": 6,
+    "rationale": "exercise a kernel-informed boundary",
+  }
+  invalid_metadata = [
+    {"evidence_tags": "addr_exp_boundary"},
+    {"evidence_tags": ["addr_exp_boundary", 7]},
+    {"evidence_tags": {"kind": "addr_exp_boundary"}},
+    {"source_evidence": ["not", "a", "string"]},
+  ]
+
+  for metadata in invalid_metadata:
+    mutation = {**base_mutation, **metadata}
+    try:
+      parse_agent_proposal(
+        json.dumps(
+          {
+            "seed": "llvm/test/CodeGen/DLC/example.ll",
+            "profile": "example",
+            "proposed_mutations": [mutation],
+          }
+        )
+      )
+    except ValueError as exc:
+      assert "evidence" in str(exc)
+    else:
+      raise AssertionError("expected ValueError")
+
+
 def test_filter_agent_mutations_rejects_unsupported_axis_and_value(tmp_path):
   profiles_dir = _make_profiles_dir(tmp_path)
   profile = get_profile("example", profiles_dir)
@@ -139,6 +211,8 @@ def test_filter_agent_mutations_rejects_unsupported_axis_and_value(tmp_path):
             "old_value": 7,
             "new_value": 6,
             "rationale": "unsupported in phase 11",
+            "evidence_tags": ["addr_exp_boundary"],
+            "source_evidence": "metadata must not make this axis supported",
           },
           {
             "axis": "shift_amount_boundary",
@@ -487,4 +561,8 @@ def test_build_agent_context_optionally_includes_kernel_usage_evidence(tmp_path)
 
   assert "kernel_usage_evidence" not in base_context
   assert context["kernel_usage_evidence"] == evidence
+  assert context["contract"]["optional_mutation_fields"] == [
+    "evidence_tags",
+    "source_evidence",
+  ]
   assert any("kernel usage evidence" in guardrail for guardrail in context["guardrails"])
