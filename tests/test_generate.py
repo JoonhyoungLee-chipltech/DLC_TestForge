@@ -511,6 +511,110 @@ def test_agent_mode_uses_proposal_file_and_records_rejections(tmp_path):
   ]
 
 
+def test_manual_mode_prioritizes_kernel_informed_candidates(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  kernel_usage_index = _write_kernel_usage_index(tmp_path)
+  out_dir = tmp_path / "workspace"
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    out_dir,
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    max_candidates=1,
+    kernel_usage_index=kernel_usage_index,
+  )
+
+  assert manifest.candidate_count == 1
+  candidate = manifest.candidates[0]
+  assert candidate.mutation_axis == "addr_exp_boundary"
+  assert candidate.source_value == 7
+  assert candidate.new_value == 6
+  assert candidate.evidence_tags == ["addr_exp_boundary"]
+  assert candidate.source_evidence == "dlc_kernels/custom_edge.c:3: test"
+  candidate_text = (out_dir / "candidates" / "candidate-0001.ll").read_text(
+    encoding="utf-8"
+  )
+  assert "mode=kernel-informed axis=addr_exp_boundary" in candidate_text
+  assert "%shl = shl i32 %x, 6" in candidate_text
+  manifest_json = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+  assert manifest_json["candidates"][0]["evidence_tags"] == ["addr_exp_boundary"]
+  assert (
+    manifest_json["candidates"][0]["source_evidence"]
+    == "dlc_kernels/custom_edge.c:3: test"
+  )
+
+
+def test_kernel_informed_generation_skips_malformed_and_duplicate_hints(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  out_dir = tmp_path / "workspace"
+  kernel_usage_index = tmp_path / "kernel-usage-index.json"
+  kernel_usage_index.write_text(
+    json.dumps(
+      {
+        "schema_version": 1,
+        "summary": {"kernel_count": 1},
+        "kernels": [
+          {
+            "name": "custom_edge",
+            "source": "dlc_kernels/custom_edge.c",
+            "usage": {},
+            "edge_hints": [
+              {"kind": "unsupported", "base": 7, "values": [6]},
+              {"kind": "addr_exp_boundary", "base": "7", "values": [6]},
+              {"kind": "addr_exp_boundary", "base": 7, "values": "bad"},
+              {
+                "kind": "addr_exp_boundary",
+                "base": 7,
+                "values": [8],
+                "source": "dlc_kernels/custom_edge.c:1",
+              },
+              {
+                "kind": "addr_exp_boundary",
+                "base": 7,
+                "values": [6],
+                "source": "dlc_kernels/custom_edge.c:2",
+              },
+            ],
+          }
+        ],
+        "global_edge_hints": [
+          {
+            "kind": "addr_exp_boundary",
+            "base": 7,
+            "values": [6],
+            "source": "dlc_kernels/custom_edge.c:2",
+          }
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    out_dir,
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    max_candidates=3,
+    kernel_usage_index=kernel_usage_index,
+  )
+
+  kernel_candidates = [
+    candidate for candidate in manifest.candidates
+    if candidate.mutation_axis == "addr_exp_boundary"
+  ]
+  assert len(kernel_candidates) == 1
+  assert kernel_candidates[0].new_value == 6
+  assert all(candidate.new_value != 8 for candidate in manifest.candidates)
+
+
 def test_agent_mode_applies_grouped_edits_to_one_candidate(tmp_path):
   llvm_root = _make_llvm_root(tmp_path)
   profiles_dir = _make_profiles_dir(tmp_path)
@@ -558,6 +662,51 @@ def test_agent_mode_applies_grouped_edits_to_one_candidate(tmp_path):
     {"old_value": 7, "new_value": 6, "line": 3},
     {"old_value": 5, "new_value": 1, "line": 4},
   ]
+
+
+def test_agent_mode_applies_kernel_informed_axis(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  proposal_path = tmp_path / "proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "proposed_mutations": [
+          {
+            "axis": "addr_exp_boundary",
+            "location_hint": "@example",
+            "old_value": 7,
+            "new_value": 6,
+            "rationale": "apply kernel-informed address exponent edge",
+            "evidence_tags": ["addr_exp_boundary"],
+            "source_evidence": "dlc_kernels/custom_edge.c:3",
+          }
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace",
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    mode="agent",
+    agent_proposal=proposal_path,
+  )
+
+  assert manifest.candidate_count == 1
+  assert manifest.candidates[0].mutation_axis == "addr_exp_boundary"
+  candidate_text = (tmp_path / "workspace" / "candidates" / "candidate-0001.ll").read_text(
+    encoding="utf-8"
+  )
+  assert "mode=agent axis=addr_exp_boundary edits=7->6" in candidate_text
+  assert "%shl = shl i32 %x, 6" in candidate_text
 
 
 def test_cli_generate_agent_mode_outputs_json(tmp_path, capsys):

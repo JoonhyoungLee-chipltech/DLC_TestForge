@@ -19,9 +19,11 @@ Implemented prototype phases:
 - DLC CodeGen test indexing;
 - DLC Markdown spec extraction;
 - DLC TableGen/source evidence extraction;
+- DLC custom kernel usage evidence extraction;
 - mutation profile loading;
 - workspace and manifest generation;
 - conservative manual candidate generation;
+- kernel-informed deterministic candidate generation;
 - candidate validation through LLVM tools;
 - validation classification;
 - review bundle generation;
@@ -57,7 +59,9 @@ python3 -m dlc_testforge.cli list-profiles --llvm-root /root/LLVM
 ## Manual Mutation Mode
 
 Manual mode generates deterministic mutations from profile-defined axes. It does
-not call an LLM.
+not call an LLM. When `--kernel-usage-index` is provided, DLC TestForge first
+uses selected kernel edge hints to create kernel-informed immediate mutations,
+then fills any remaining candidate budget with the generic manual mutator.
 
 ```bash
 python3 -m dlc_testforge.cli generate \
@@ -74,6 +78,7 @@ Main artifacts:
 - `/tmp/dlc-mutation-run/inputs/test-index.json`
 - `/tmp/dlc-mutation-run/inputs/spec-index.json`
 - `/tmp/dlc-mutation-run/inputs/td-index.json`
+- `/tmp/dlc-mutation-run/inputs/kernel-usage-index.json`, when provided;
 - `/tmp/dlc-mutation-run/candidates/candidate-*.ll`
 
 Use `--dry-run` to create only workspace inputs and indexes:
@@ -86,6 +91,35 @@ python3 -m dlc_testforge.cli generate \
   --out-dir /tmp/dlc-mutation-dry-run \
   --dry-run
 ```
+
+## Kernel Usage Evidence
+
+Extract structured usage evidence from `DLC_Custom_Kernel`:
+
+```bash
+python3 -m dlc_testforge.cli extract-kernel \
+  --kernel-root /root/DLC_Custom_Kernel \
+  --out /tmp/dlc-kernel-usage-index.json
+```
+
+Use the extracted index during generation:
+
+```bash
+python3 -m dlc_testforge.cli generate \
+  --llvm-root /root/LLVM \
+  --profile machine_addropt \
+  --seed llvm/test/CodeGen/DLC/machine-addropt-prera.ll \
+  --out-dir /tmp/dlc-kernel-informed-run \
+  --kernel-usage-index /tmp/dlc-kernel-usage-index.json \
+  --max-candidates 10
+```
+
+Supported kernel-informed axes are `addr_exp_boundary`,
+`dma_length_boundary`, `stride_boundary`, `tile_boundary`, `mask_boundary`, and
+`vector_lane_boundary`. The current mutator still applies only integer
+immediate replacements allowed by the active profile. Kernel evidence changes
+candidate selection and metadata; validation and classification remain the
+authority for whether a generated test is useful.
 
 ## Agent Mutation Mode
 
@@ -161,7 +195,9 @@ Proposal shape:
           "occurrence": 2
         }
       ],
-      "rationale": "exercise adjacent shift boundary"
+      "rationale": "exercise adjacent shift boundary",
+      "evidence_tags": ["addr_exp_boundary"],
+      "source_evidence": "kernel usage evidence contains address exponent hints"
     }
   ]
 }

@@ -437,27 +437,39 @@ Verification:
 
 ### Step 10: Add Kernel-Informed Mutator Support
 
-Do this only after extraction and context plumbing are stable.
+Implemented deterministic support connects selected kernel `edge_hints` to
+candidate generation when `--kernel-usage-index` is provided.
 
-Initial deterministic additions:
+Implemented named axis support:
 
-- Add named axis support for:
-  - `addr_exp_boundary`
-  - `dma_length_boundary`
-  - `stride_boundary`
-  - `vector_lane_boundary`
-  - `mask_boundary`
-- Map each axis to line matching rules in `.ll`:
-  - shifts and address scaling -> `shl`, `lshr`, `ashr`, `mul`, `getelementptr`;
-  - vector lanes and masks -> vector types, mask constants, `select`, compare;
-  - DMA-like address tests -> constants near existing address arithmetic.
-- Keep applying only integer immediate replacements until a stronger IR parser
-  exists.
+- `addr_exp_boundary`
+- `dma_length_boundary`
+- `stride_boundary`
+- `tile_boundary`
+- `vector_lane_boundary`
+- `mask_boundary`
+
+Current behavior:
+
+- Manual generation prioritizes kernel-informed candidates before generic
+  immediate candidates when a kernel usage index is available.
+- The mutator maps each axis to conservative `.ll` line matching rules:
+  - address-like axes match shifts, arithmetic, pointer casts, and GEP-like
+    lines;
+  - vector and mask axes match vector types, mask-like names, selects, compares,
+    and bitwise mask operations.
+- Only integer immediate replacements are applied.
+- New values must still be listed in `profile.mutation_axes.immediates.values`.
+- Candidate manifest entries record `evidence_tags` and `source_evidence`.
+- Agent proposals may use the same kernel-informed axis names, but they remain
+  subject to the same value and line-application guardrails.
 
 Verification:
 
-- Each axis has one focused seed fixture.
-- Unsupported axis is rejected with a clear reason.
+- Existing no-kernel manual generation remains unchanged.
+- Kernel-informed generation records evidence metadata in the manifest.
+- Malformed, unsupported, duplicate, or profile-disallowed hints are skipped.
+- Agent proposals using kernel-informed axis names can be accepted and applied.
 - Generated candidates remain isolated under workspace `candidates/`.
 
 ## Test Plan

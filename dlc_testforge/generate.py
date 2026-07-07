@@ -25,6 +25,24 @@ from dlc_testforge.profiles import get_profile
 
 TOOL_VERSION = "0.1"
 INTEGER_RE = re.compile(r"(?<![%@A-Za-z0-9_.])-?\d+\b")
+KERNEL_INFORMED_AXES = {
+  "addr_exp_boundary",
+  "dma_length_boundary",
+  "stride_boundary",
+  "tile_boundary",
+  "mask_boundary",
+  "vector_lane_boundary",
+}
+ADDRESS_LIKE_KERNEL_AXES = {
+  "addr_exp_boundary",
+  "dma_length_boundary",
+  "stride_boundary",
+  "tile_boundary",
+}
+VECTOR_LIKE_KERNEL_AXES = {
+  "mask_boundary",
+  "vector_lane_boundary",
+}
 
 
 @dataclass(frozen=True)
@@ -39,6 +57,8 @@ class CandidateRecord:
   comment: str
   rationale: str | None = None
   edits: list[dict[str, Any]] | None = None
+  evidence_tags: list[str] | None = None
+  source_evidence: str | None = None
 
   def to_dict(self) -> dict[str, Any]:
     data = {
@@ -55,6 +75,10 @@ class CandidateRecord:
       data["rationale"] = self.rationale
     if self.edits is not None:
       data["edits"] = self.edits
+    if self.evidence_tags:
+      data["evidence_tags"] = self.evidence_tags
+    if self.source_evidence:
+      data["source_evidence"] = self.source_evidence
     return data
 
 
@@ -188,6 +212,7 @@ def create_workspace(
         profile.mutation_axes,
         candidates_dir,
         max_candidates,
+        kernel_usage_evidence=selected_kernel_evidence,
       )
     else:
       if agent_proposal is not None:
@@ -281,6 +306,8 @@ def _generate_candidates(
   mutation_axes: dict[str, Any],
   candidates_dir: Path,
   max_candidates: int,
+  *,
+  kernel_usage_evidence: dict[str, Any] | None = None,
 ) -> list[CandidateRecord]:
   if not seed_relative.endswith(".ll"):
     return []
@@ -291,12 +318,32 @@ def _generate_candidates(
   values = immediate_axis.get("values", [])
   if not isinstance(values, list):
     return []
-  mutation_values = [value for value in values if isinstance(value, int)]
+  mutation_values = [
+    value for value in values
+    if isinstance(value, int) and not isinstance(value, bool)
+  ]
   if not mutation_values:
     return []
 
   lines = seed_text.splitlines(keepends=True)
   candidates: list[CandidateRecord] = []
+  used_replacements: set[tuple[int, int, int]] = set()
+
+  if kernel_usage_evidence is not None:
+    candidates.extend(
+      _generate_kernel_informed_candidates(
+        lines,
+        seed_relative,
+        profile_name,
+        set(mutation_values),
+        candidates_dir,
+        max_candidates,
+        used_replacements,
+        kernel_usage_evidence,
+      )
+    )
+    if len(candidates) >= max_candidates:
+      return candidates
 
   for line_index, line in enumerate(lines):
     if not _is_mutable_ir_line(line):
@@ -306,6 +353,9 @@ def _generate_candidates(
       axis = _axis_for_line(line)
       for new_value in mutation_values:
         if new_value == source_value:
+          continue
+        replacement_key = (line_index, source_value, new_value)
+        if replacement_key in used_replacements:
           continue
         candidate_number = len(candidates) + 1
         filename = f"candidate-{candidate_number:04d}.ll"
@@ -332,9 +382,93 @@ def _generate_candidates(
             comment=comment,
           )
         )
+        used_replacements.add(replacement_key)
         if len(candidates) >= max_candidates:
           return candidates
 
+  return candidates
+
+
+def _generate_kernel_informed_candidates(
+  lines: list[str],
+  seed_relative: str,
+  profile_name: str,
+  mutation_values: set[int],
+  candidates_dir: Path,
+  max_candidates: int,
+  used_replacements: set[tuple[int, int, int]],
+  kernel_usage_evidence: dict[str, Any],
+) -> list[CandidateRecord]:
+  candidates: list[CandidateRecord] = []
+  for hint in _kernel_edge_hints(kernel_usage_evidence):
+    axis = hint.get("kind")
+    base = hint.get("base")
+    values = hint.get("values")
+    if axis not in KERNEL_INFORMED_AXES:
+      continue
+    if not isinstance(base, int) or isinstance(base, bool):
+      continue
+    if not isinstance(values, list):
+      continue
+    new_values = [
+      value for value in values
+      if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value != base
+        and value in mutation_values
+      )
+    ]
+    if not new_values:
+      continue
+
+    for line_index, line in enumerate(lines):
+      if not _is_mutable_ir_line(line):
+        continue
+      if not _kernel_axis_matches_line(axis, line):
+        continue
+      for match in INTEGER_RE.finditer(line):
+        if int(match.group(0)) != base:
+          continue
+        for new_value in new_values:
+          replacement_key = (line_index, base, new_value)
+          if replacement_key in used_replacements:
+            continue
+          candidate_number = len(candidates) + 1
+          filename = f"candidate-{candidate_number:04d}.ll"
+          source = _one_line_string(hint.get("source") or "unknown")
+          reason = _one_line_string(hint.get("reason") or "")
+          comment = (
+            f"; DLC-MUTATION: profile={profile_name} mode=kernel-informed "
+            f"axis={axis} source_value={base} new_value={new_value} "
+            f"evidence={source}"
+          )
+          candidate_lines = list(lines)
+          candidate_lines[line_index] = (
+            f"{comment}\n"
+            f"{line[:match.start()]}{new_value}{line[match.end():]}"
+          )
+          candidate_path = candidates_dir / filename
+          candidate_path.write_text("".join(candidate_lines), encoding="utf-8")
+          candidates.append(
+            CandidateRecord(
+              path=f"candidates/{filename}",
+              seed=seed_relative,
+              profile=profile_name,
+              mutation_axis=axis,
+              source_value=base,
+              new_value=new_value,
+              line=line_index + 1,
+              comment=comment,
+              evidence_tags=[axis],
+              source_evidence=(
+                f"{source}: {reason}" if reason else source
+              ),
+            )
+          )
+          used_replacements.add(replacement_key)
+          if len(candidates) >= max_candidates:
+            return candidates
   return candidates
 
 
@@ -491,9 +625,75 @@ def _agent_axis_matches_line(axis: str, line: str) -> bool:
   line_axis = _axis_for_line(line)
   if axis == "immediates":
     return True
+  if axis in KERNEL_INFORMED_AXES:
+    return _kernel_axis_matches_line(axis, line)
   if axis == "immediate_boundary":
     return line_axis == "immediate_boundary"
   return axis == line_axis
+
+
+def _kernel_axis_matches_line(axis: str, line: str) -> bool:
+  if axis in ADDRESS_LIKE_KERNEL_AXES:
+    return _is_address_like_line(line)
+  if axis in VECTOR_LIKE_KERNEL_AXES:
+    return _is_vector_or_mask_line(line)
+  return False
+
+
+def _is_address_like_line(line: str) -> bool:
+  lowered = line.lower()
+  return any(
+    token in lowered
+    for token in [
+      " shl ",
+      " lshr ",
+      " ashr ",
+      " add ",
+      " sub ",
+      " mul ",
+      " getelementptr ",
+      " ptrtoint ",
+      " inttoptr ",
+    ]
+  )
+
+
+def _is_vector_or_mask_line(line: str) -> bool:
+  lowered = line.lower()
+  if re.search(r"<\s*\d+\s+x", line):
+    return True
+  return any(
+    token in lowered
+    for token in [
+      " select ",
+      " icmp ",
+      " fcmp ",
+      " and ",
+      " or ",
+      " xor ",
+      "mask",
+      "msk",
+    ]
+  )
+
+
+def _kernel_edge_hints(kernel_usage_evidence: dict[str, Any]) -> list[dict[str, Any]]:
+  hints: list[dict[str, Any]] = []
+  for record in kernel_usage_evidence.get("kernels", []):
+    if not isinstance(record, dict):
+      continue
+    edge_hints = record.get("edge_hints", [])
+    if not isinstance(edge_hints, list):
+      continue
+    hints.extend(hint for hint in edge_hints if isinstance(hint, dict))
+  global_hints = kernel_usage_evidence.get("global_edge_hints", [])
+  if isinstance(global_hints, list):
+    hints.extend(hint for hint in global_hints if isinstance(hint, dict))
+  return hints
+
+
+def _one_line_string(value: Any) -> str:
+  return str(value).replace("\n", " ").strip()
 
 
 def _is_mutable_ir_line(line: str) -> bool:

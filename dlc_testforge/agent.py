@@ -15,6 +15,14 @@ DEFAULT_ENDPOINT = "https://api.openai.com/v1"
 PLACEHOLDER_VALUES = {"", "sk-", "Please fill out"}
 CODEX_AUTH_PATH = Path("/root/.codex/auth.json")
 CODEX_CONFIG_PATH = Path("/root/.codex/config.toml")
+KERNEL_INFORMED_AGENT_AXES = {
+  "addr_exp_boundary",
+  "dma_length_boundary",
+  "stride_boundary",
+  "tile_boundary",
+  "mask_boundary",
+  "vector_lane_boundary",
+}
 
 
 @dataclass(frozen=True)
@@ -634,7 +642,7 @@ def _rejection_reason(
     "immediates",
     "immediate_boundary",
     "shift_amount_boundary",
-  }:
+  } | KERNEL_INFORMED_AGENT_AXES:
     return f"unsupported mutation axis for current agent generator: {mutation.axis}"
   for edit in mutation.edits:
     if edit.old_value == edit.new_value:
