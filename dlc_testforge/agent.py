@@ -139,6 +139,65 @@ def build_agent_context(
   }
 
 
+def select_kernel_evidence(
+  kernel_index: dict[str, Any] | None,
+  profile_name: str,
+  seed_relative: str,
+  max_records: int = 12,
+) -> dict[str, Any]:
+  empty = {
+    "summary": {},
+    "selection": {
+      "profile": profile_name,
+      "seed": seed_relative,
+      "max_records": max_records,
+      "selected_count": 0,
+    },
+    "kernels": [],
+    "global_edge_hints": [],
+  }
+  if not isinstance(kernel_index, dict):
+    return empty
+  kernels = kernel_index.get("kernels")
+  if not isinstance(kernels, list):
+    return empty
+
+  scored = []
+  for record in kernels:
+    if not isinstance(record, dict):
+      continue
+    score = _kernel_evidence_score(record, profile_name)
+    if score <= 0:
+      continue
+    scored.append((score, record))
+
+  scored.sort(
+    key=lambda item: (
+      -item[0],
+      str(item[1].get("source") or ""),
+      str(item[1].get("name") or ""),
+    )
+  )
+  limit = max(max_records, 0)
+  selected = [
+    _prune_kernel_evidence(record, score)
+    for score, record in scored[:limit]
+  ]
+  return {
+    "summary": kernel_index.get("summary")
+    if isinstance(kernel_index.get("summary"), dict)
+    else {},
+    "selection": {
+      "profile": profile_name,
+      "seed": seed_relative,
+      "max_records": max_records,
+      "selected_count": len(selected),
+    },
+    "kernels": selected,
+    "global_edge_hints": _limit_dict_list(kernel_index.get("global_edge_hints"), 20),
+  }
+
+
 def load_agent_proposal(path: Path) -> AgentProposal:
   text = path.expanduser().read_text(encoding="utf-8")
   return parse_agent_proposal(text)
@@ -540,6 +599,125 @@ def _find_seed_record(
     if isinstance(record, dict) and record.get("path") == seed_relative:
       return record
   return None
+
+
+def _kernel_evidence_score(record: dict[str, Any], profile_name: str) -> int:
+  if profile_name == "machine_addropt":
+    return _machine_addropt_kernel_score(record)
+  if profile_name == "globalisel":
+    return _globalisel_kernel_score(record)
+  return _fallback_kernel_score(record)
+
+
+def _machine_addropt_kernel_score(record: dict[str, Any]) -> int:
+  usage = _record_usage(record)
+  score = 0
+  score += 5 * len(_matching_edge_kinds(
+    record,
+    {"addr_exp_boundary", "dma_length_boundary", "stride_boundary", "tile_boundary"},
+  ))
+  if usage.get("dma_calls"):
+    score += 3
+  score += 2 * len(_matching_relation_kinds(
+    usage,
+    {"address_exponent", "dma_length_boundary", "stride_boundary", "memory_space_pair"},
+  ))
+  if set(_list_or_empty(usage.get("memory_spaces"))) & {"HBM", "VMEM", "CMEM", "SMEM"}:
+    score += 2
+  if set(_list_or_empty(usage.get("constants"))) & {7, 128, 256, 1024}:
+    score += 1
+  return score
+
+
+def _globalisel_kernel_score(record: dict[str, Any]) -> int:
+  usage = _record_usage(record)
+  score = 0
+  if usage.get("vector_types") or usage.get("intrinsics"):
+    score += 5
+  score += 4 * len(_matching_edge_kinds(
+    record,
+    {"vector_lane_boundary", "mask_boundary"},
+  ))
+  if record.get("dtype_hints"):
+    score += 3
+  score += 2 * len(_matching_relation_kinds(
+    usage,
+    {"mask_boundary", "tile_boundary"},
+  ))
+  if set(_list_or_empty(usage.get("constants"))) & {8, 32, 128, 1024}:
+    score += 1
+  return score
+
+
+def _fallback_kernel_score(record: dict[str, Any]) -> int:
+  usage = _record_usage(record)
+  score = len(_list_or_empty(record.get("edge_hints")))
+  score += len(_list_or_empty(usage.get("relations")))
+  if usage.get("dma_calls") or usage.get("vector_types") or usage.get("intrinsics"):
+    score += 1
+  return score
+
+
+def _matching_edge_kinds(record: dict[str, Any], kinds: set[str]) -> set[str]:
+  result = set()
+  for hint in _list_or_empty(record.get("edge_hints")):
+    if isinstance(hint, dict) and hint.get("kind") in kinds:
+      result.add(str(hint["kind"]))
+  return result
+
+
+def _matching_relation_kinds(usage: dict[str, Any], kinds: set[str]) -> set[str]:
+  result = set()
+  for relation in _list_or_empty(usage.get("relations")):
+    if isinstance(relation, dict) and relation.get("kind") in kinds:
+      result.add(str(relation["kind"]))
+  return result
+
+
+def _prune_kernel_evidence(record: dict[str, Any], score: int) -> dict[str, Any]:
+  usage = _record_usage(record)
+  return {
+    "name": record.get("name"),
+    "source": record.get("source"),
+    "category": record.get("category"),
+    "dtype_hints": _list_or_empty(record.get("dtype_hints")),
+    "features": _list_or_empty(record.get("features")),
+    "usage": {
+      "dma_calls": _limit_dict_list(usage.get("dma_calls"), 4),
+      "memory_spaces": _list_or_empty(usage.get("memory_spaces")),
+      "vector_types": _list_or_empty(usage.get("vector_types"))[:8],
+      "intrinsics": _list_or_empty(usage.get("intrinsics"))[:12],
+      "constants": _list_or_empty(usage.get("constants"))[:16],
+      "relations": _limit_dict_list(usage.get("relations"), 8),
+    },
+    "edge_hints": _sorted_edge_hints(record.get("edge_hints"))[:12],
+    "selection_score": score,
+  }
+
+
+def _record_usage(record: dict[str, Any]) -> dict[str, Any]:
+  usage = record.get("usage")
+  return usage if isinstance(usage, dict) else {}
+
+
+def _list_or_empty(value: Any) -> list[Any]:
+  return value if isinstance(value, list) else []
+
+
+def _limit_dict_list(value: Any, limit: int) -> list[dict[str, Any]]:
+  return [item for item in _list_or_empty(value) if isinstance(item, dict)][:limit]
+
+
+def _sorted_edge_hints(value: Any) -> list[dict[str, Any]]:
+  hints = [item for item in _list_or_empty(value) if isinstance(item, dict)]
+  return sorted(
+    hints,
+    key=lambda hint: (
+      str(hint.get("kind") or ""),
+      str(hint.get("source") or ""),
+      hint.get("base") if isinstance(hint.get("base"), int) else 0,
+    ),
+  )
 
 
 def _select_spec_records(

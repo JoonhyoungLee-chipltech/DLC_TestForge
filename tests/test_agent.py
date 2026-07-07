@@ -6,9 +6,58 @@ from dlc_testforge.agent import (
   filter_agent_mutations,
   parse_agent_proposal,
   request_agent_proposal,
+  select_kernel_evidence,
 )
 from dlc_testforge.profiles import get_profile
 from tests.test_generate import _make_profiles_dir
+
+
+def _kernel_record(
+  name,
+  *,
+  source,
+  edge_kinds=(),
+  relation_kinds=(),
+  dma=False,
+  vector_types=(),
+  intrinsics=(),
+  dtype_hints=(),
+  constants=(),
+  memory_spaces=(),
+  extra=None,
+):
+  record = {
+    "name": name,
+    "source": source,
+    "category": "test",
+    "dtype_hints": list(dtype_hints),
+    "features": [],
+    "usage": {
+      "dma_calls": [{"line": 1}] if dma else [],
+      "sync_calls": [],
+      "memory_spaces": list(memory_spaces),
+      "vector_types": list(vector_types),
+      "intrinsics": list(intrinsics),
+      "constants": list(constants),
+      "relations": [
+        {"kind": kind, "line": index + 1, "evidence": kind, "reason": "test"}
+        for index, kind in enumerate(relation_kinds)
+      ],
+    },
+    "edge_hints": [
+      {
+        "kind": kind,
+        "base": index + 1,
+        "values": [index, index + 1, index + 2],
+        "source": f"{source}:{index + 1}",
+        "reason": "test",
+      }
+      for index, kind in enumerate(edge_kinds)
+    ],
+  }
+  if extra:
+    record.update(extra)
+  return record
 
 
 def test_parse_agent_proposal_accepts_json_fence():
@@ -266,3 +315,148 @@ base_url = "https://openrouter.example.test/v1"
   assert captured["url"] == "https://openrouter.example.test/v1/chat/completions"
   assert captured["payload"]["model"] == "openai/gpt-5.5"
   assert captured["headers"]["Authorization"] == "Bearer sk-codex-test"
+
+
+def test_select_kernel_evidence_prefers_machine_addropt_address_records():
+  kernel_index = {
+    "summary": {"kernel_count": 3},
+    "global_edge_hints": [],
+    "kernels": [
+      _kernel_record(
+        "vector_only",
+        source="dlc_kernels/vector.c",
+        edge_kinds=["vector_lane_boundary"],
+        vector_types=["float8_128"],
+      ),
+      _kernel_record(
+        "address_rich",
+        source="dlc_kernels/address.c",
+        edge_kinds=["addr_exp_boundary", "dma_length_boundary", "stride_boundary"],
+        relation_kinds=["address_exponent", "memory_space_pair"],
+        dma=True,
+        constants=[7, 128],
+        memory_spaces=["HBM", "VMEM"],
+      ),
+    ],
+  }
+
+  selected = select_kernel_evidence(
+    kernel_index,
+    "machine_addropt",
+    "llvm/test/CodeGen/DLC/machine-addropt-prera.ll",
+    max_records=1,
+  )
+
+  assert selected["summary"] == {"kernel_count": 3}
+  assert selected["selection"]["selected_count"] == 1
+  assert selected["kernels"][0]["name"] == "address_rich"
+  assert selected["kernels"][0]["selection_score"] > 0
+
+
+def test_select_kernel_evidence_prefers_globalisel_vector_records():
+  kernel_index = {
+    "kernels": [
+      _kernel_record(
+        "dma_only",
+        source="dlc_kernels/dma.c",
+        edge_kinds=["addr_exp_boundary"],
+        relation_kinds=["address_exponent"],
+        dma=True,
+      ),
+      _kernel_record(
+        "vector_mask",
+        source="dlc_kernels/vector.c",
+        edge_kinds=["vector_lane_boundary", "mask_boundary"],
+        relation_kinds=["mask_boundary"],
+        vector_types=["float8_128"],
+        intrinsics=["v_f32_ld_tnsr_st_msk"],
+        dtype_hints=["f32"],
+        constants=[8, 128],
+      ),
+    ],
+  }
+
+  selected = select_kernel_evidence(
+    kernel_index,
+    "globalisel",
+    "llvm/test/CodeGen/DLC/GIISel/basic.ll",
+    max_records=1,
+  )
+
+  assert selected["kernels"][0]["name"] == "vector_mask"
+
+
+def test_select_kernel_evidence_is_deterministic_and_respects_max_records():
+  kernel_index = {
+    "kernels": [
+      _kernel_record("b", source="dlc_kernels/b.c", dma=True),
+      _kernel_record("a", source="dlc_kernels/a.c", dma=True),
+      _kernel_record("c", source="dlc_kernels/c.c", dma=True),
+    ],
+  }
+
+  selected = select_kernel_evidence(
+    kernel_index,
+    "unknown_profile",
+    "seed.ll",
+    max_records=2,
+  )
+
+  assert [record["name"] for record in selected["kernels"]] == ["a", "b"]
+  assert selected["selection"]["selected_count"] == 2
+
+
+def test_select_kernel_evidence_handles_malformed_input():
+  selected = select_kernel_evidence(None, "machine_addropt", "seed.ll")
+
+  assert selected == {
+    "summary": {},
+    "selection": {
+      "profile": "machine_addropt",
+      "seed": "seed.ll",
+      "max_records": 12,
+      "selected_count": 0,
+    },
+    "kernels": [],
+    "global_edge_hints": [],
+  }
+  malformed = select_kernel_evidence({"kernels": "bad"}, "globalisel", "seed.ll")
+  assert malformed["kernels"] == []
+
+
+def test_select_kernel_evidence_prunes_records_and_caps_global_edges():
+  kernel_index = {
+    "summary": {"kernel_count": 1},
+    "global_edge_hints": [
+      {"kind": "tile_boundary", "base": index}
+      for index in range(25)
+    ],
+    "kernels": [
+      _kernel_record(
+        "wide",
+        source="dlc_kernels/wide.c",
+        edge_kinds=["mask_boundary", "vector_lane_boundary"],
+        relation_kinds=["mask_boundary"] * 10,
+        vector_types=[f"type{index}_128" for index in range(10)],
+        intrinsics=[f"v_op_{index}" for index in range(14)],
+        constants=list(range(20)),
+        extra={"raw_source": "do not include"},
+      )
+    ],
+  }
+
+  selected = select_kernel_evidence(
+    kernel_index,
+    "globalisel",
+    "seed.ll",
+    max_records=1,
+  )
+  record = selected["kernels"][0]
+
+  assert "raw_source" not in record
+  assert len(record["usage"]["vector_types"]) == 8
+  assert len(record["usage"]["intrinsics"]) == 12
+  assert len(record["usage"]["constants"]) == 16
+  assert len(record["usage"]["relations"]) == 8
+  assert len(record["edge_hints"]) == 2
+  assert len(selected["global_edge_hints"]) == 20
