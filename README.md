@@ -207,6 +207,71 @@ For backward compatibility, a mutation may still use top-level `old_value` and
 `new_value`. Prefer `edits` when related immediates must be changed together in
 one candidate.
 
+## Agent Full-File Mode
+
+Agent full-file mode asks an LLM to write complete `.ll` candidate files from
+one seed `.ll` test. DLC TestForge builds a deterministic context from the seed,
+nearby tests, profile data, DLC specs, backend source evidence, and optional
+kernel usage evidence. It then parses the model response, applies quality gates,
+writes accepted candidates under the workspace, and records rejected candidates.
+
+```bash
+python3 -m dlc_testforge.cli generate \
+  --llvm-root /root/LLVM \
+  --profile machine_addropt \
+  --seed llvm/test/CodeGen/DLC/machine-addropt-prera.ll \
+  --out-dir /tmp/dlc-full-file-agent-run \
+  --mode agent-full-file \
+  --kernel-usage-index /tmp/dlc-kernel-usage-index.json \
+  --max-candidates 5
+```
+
+To run without an API call, provide a full-file proposal:
+
+```bash
+python3 -m dlc_testforge.cli generate \
+  --llvm-root /root/LLVM \
+  --profile machine_addropt \
+  --seed llvm/test/CodeGen/DLC/machine-addropt-prera.ll \
+  --out-dir /tmp/dlc-full-file-agent-file-run \
+  --mode agent-full-file \
+  --agent-full-file-proposal /path/to/full-file-proposal.json
+```
+
+Full-file agent artifacts:
+
+- `inputs/full-file-agent-context.json`: structured prompt context;
+- `inputs/full-file-agent-proposal.json`: parsed model proposal;
+- `results/full-file-agent-rejections.json`: rejected candidates and reasons;
+- `candidates/candidate-*.ll`: accepted complete `.ll` candidate files;
+- `manifest.json`: candidate metadata, including `suggested_filename` and
+  `intended_stress` when provided.
+
+Proposal shape:
+
+```json
+{
+  "seed": "llvm/test/CodeGen/DLC/machine-addropt-prera.ll",
+  "profile": "machine_addropt",
+  "candidates": [
+    {
+      "filename": "machine-addropt-prera-mut-two-scaled-bases.ll",
+      "text": "; RUN: llc -mtriple=dlc %s -o - | FileCheck %s\n\ndefine i32 @candidate(i32 %x) {\n  ret i32 %x\n}\n",
+      "rationale": "Stress a complete address-combine test variant.",
+      "intended_stress": "machine address combine with reused scaled operands",
+      "evidence_tags": ["addr_exp_boundary"],
+      "source_evidence": "kernel usage evidence contains address exponent hints"
+    }
+  ]
+}
+```
+
+Generated full-file outputs are review candidates, not accepted regression
+tests. Validate, classify, and report them with the same workflow used for
+manual and structured agent candidates. Candidates without useful FileCheck
+coverage may classify as `needs-checks`; promising candidates should be edited
+and added to LLVM manually.
+
 ## Validation and Reports
 
 Validate one candidate:
