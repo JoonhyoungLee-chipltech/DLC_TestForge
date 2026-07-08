@@ -473,6 +473,126 @@ def request_agent_proposal(
   return parse_agent_proposal(content)
 
 
+def request_agent_full_file_proposal(
+  context: dict[str, Any],
+  *,
+  model: str | None = None,
+  endpoint: str | None = None,
+  api_key: str | None = None,
+  max_candidates: int | None = None,
+) -> AgentFullFileProposal:
+  resolved_model = _first_config_value(
+    model,
+    os.environ.get("DLC_TESTFORGE_LM_MODEL"),
+    os.environ.get("LLVM_HARNESS_LM_MODEL"),
+    _load_codex_config().get("model"),
+  )
+  if not resolved_model:
+    raise ValueError(
+      "agent mode requires --agent-model, DLC_TESTFORGE_LM_MODEL, or "
+      "LLVM_HARNESS_LM_MODEL when no --agent-proposal is provided"
+    )
+
+  resolved_api_key = _first_config_value(
+    api_key,
+    os.environ.get("DLC_TESTFORGE_LM_API_KEY"),
+    os.environ.get("LLVM_HARNESS_LM_API_KEY"),
+    _load_codex_auth().get("OPENAI_API_KEY"),
+  )
+  if not resolved_api_key:
+    raise ValueError(
+      "agent mode requires DLC_TESTFORGE_LM_API_KEY or LLVM_HARNESS_LM_API_KEY "
+      "when no --agent-proposal is provided"
+    )
+
+  resolved_endpoint = _first_config_value(
+    endpoint,
+    os.environ.get("DLC_TESTFORGE_LM_API_ENDPOINT"),
+    os.environ.get("LLVM_HARNESS_LM_API_ENDPOINT"),
+    _load_codex_config().get("provider.base_url"),
+    DEFAULT_ENDPOINT,
+  ).rstrip("/")
+  resolved_model = _migrate_codex_model(resolved_model)
+  seed_relative = context.get("seed", {}).get("path")
+  profile_name = context.get("profile", {}).get("name")
+  payload = {
+    "model": resolved_model,
+    "temperature": 0,
+    "messages": [
+      {
+        "role": "system",
+        "content": (
+          "You write complete DLC LLVM .ll test mutation candidates. "
+          "Return only one JSON object. Do not include Markdown fences, prose, "
+          "comments outside JSON, or extra top-level fields. Each candidate text "
+          "must be a complete .ll file. Do not invent DLC intrinsics, "
+          "instructions, address spaces, or datalayouts. Validation and "
+          "classification will decide whether candidates are useful."
+        ),
+      },
+      {
+        "role": "user",
+        "content": "\n".join(
+          [
+            "Use this context to write full-file candidate tests:",
+            json.dumps(context, indent=2, sort_keys=True),
+            "",
+            "Return this exact JSON shape:",
+            json.dumps(
+              {
+                "seed": seed_relative or "",
+                "profile": profile_name or "",
+                "candidates": [
+                  {
+                    "filename": "seed-mutated-stress.ll",
+                    "text": "; RUN: ...\n\ndefine void @candidate() {\n  ret void\n}\n",
+                    "rationale": "why this complete candidate is worth trying",
+                    "intended_stress": "one clear stress point",
+                    "evidence_tags": ["addr_exp_boundary"],
+                    "source_evidence": (
+                      "kernel usage evidence includes address exponent boundary hints"
+                    ),
+                  }
+                ],
+              },
+              indent=2,
+              sort_keys=True,
+            ),
+            "Use an empty candidates list only if no valid candidate can be written.",
+          ]
+        ),
+      },
+    ],
+  }
+  request = urllib.request.Request(
+    f"{resolved_endpoint}/chat/completions",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={
+      "Authorization": f"Bearer {resolved_api_key}",
+      "Content-Type": "application/json",
+    },
+    method="POST",
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=120) as response:
+      response_data = json.loads(response.read().decode("utf-8"))
+  except urllib.error.URLError as exc:
+    raise ValueError(f"agent request failed: {exc}") from exc
+
+  try:
+    content = response_data["choices"][0]["message"]["content"]
+  except (KeyError, IndexError, TypeError) as exc:
+    raise ValueError(
+      "agent full-file response did not contain choices[0].message.content"
+    ) from exc
+  return parse_agent_full_file_proposal(
+    content,
+    seed_relative=seed_relative,
+    profile_name=profile_name,
+    max_candidates=max_candidates,
+  )
+
+
 def parse_agent_proposal(text: str) -> AgentProposal:
   data = _loads_json_object(text)
   if not isinstance(data, dict):

@@ -9,6 +9,7 @@ from dlc_testforge.agent import (
   load_agent_full_file_proposal,
   parse_agent_full_file_proposal,
   parse_agent_proposal,
+  request_agent_full_file_proposal,
   request_agent_proposal,
   select_kernel_evidence,
 )
@@ -928,6 +929,214 @@ base_url = "https://openrouter.example.test/v1"
   assert captured["url"] == "https://openrouter.example.test/v1/chat/completions"
   assert captured["payload"]["model"] == "openai/gpt-5.5"
   assert captured["headers"]["Authorization"] == "Bearer sk-codex-test"
+
+
+def test_request_agent_full_file_proposal_accepts_llvm_harness_env(monkeypatch):
+  captured = {}
+  context = {
+    "seed": {"path": "llvm/test/CodeGen/DLC/example.ll"},
+    "profile": {"name": "example"},
+  }
+
+  class FakeResponse:
+    def __enter__(self):
+      return self
+
+    def __exit__(self, *_):
+      return None
+
+    def read(self):
+      return json.dumps(
+        {
+          "choices": [
+            {
+              "message": {
+                "content": json.dumps(
+                  {
+                    "seed": "llvm/test/CodeGen/DLC/example.ll",
+                    "profile": "example",
+                    "candidates": [
+                      {
+                        "filename": "example-agent-0.ll",
+                        "text": "define void @example0() { ret void }\n",
+                        "rationale": "first complete candidate",
+                        "intended_stress": "first stress point",
+                      },
+                      {
+                        "filename": "example-agent-1.ll",
+                        "text": "define void @example1() { ret void }\n",
+                        "rationale": "second complete candidate",
+                        "intended_stress": "second stress point",
+                      },
+                    ],
+                  }
+                )
+              }
+            }
+          ]
+        }
+      ).encode("utf-8")
+
+  def fake_urlopen(request, timeout):
+    captured["url"] = request.full_url
+    captured["headers"] = dict(request.header_items())
+    captured["payload"] = json.loads(request.data.decode("utf-8"))
+    captured["timeout"] = timeout
+    return FakeResponse()
+
+  monkeypatch.delenv("DLC_TESTFORGE_LM_API_KEY", raising=False)
+  monkeypatch.delenv("DLC_TESTFORGE_LM_API_ENDPOINT", raising=False)
+  monkeypatch.delenv("DLC_TESTFORGE_LM_MODEL", raising=False)
+  monkeypatch.setenv("LLVM_HARNESS_LM_API_KEY", "sk-full-file-test")
+  monkeypatch.setenv("LLVM_HARNESS_LM_API_ENDPOINT", "https://example.test/v1")
+  monkeypatch.setenv("LLVM_HARNESS_LM_MODEL", "test-full-file-model")
+  monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+  proposal = request_agent_full_file_proposal(context, max_candidates=1)
+
+  assert proposal.seed == "llvm/test/CodeGen/DLC/example.ll"
+  assert [candidate.filename for candidate in proposal.candidates] == [
+    "example-agent-0.ll"
+  ]
+  assert captured["url"] == "https://example.test/v1/chat/completions"
+  assert captured["payload"]["model"] == "test-full-file-model"
+  assert captured["payload"]["temperature"] == 0
+  assert captured["timeout"] == 120
+  assert captured["headers"]["Authorization"] == "Bearer sk-full-file-test"
+  assert (
+    "complete DLC LLVM .ll test mutation candidates"
+    in captured["payload"]["messages"][0]["content"]
+  )
+  user_message = captured["payload"]["messages"][1]["content"]
+  assert "Use this context to write full-file candidate tests:" in user_message
+  assert "Return this exact JSON shape:" in user_message
+  assert "intended_stress" in user_message
+
+
+def test_request_agent_full_file_proposal_accepts_codex_auth_and_config(
+  tmp_path, monkeypatch
+):
+  captured = {}
+  context = {
+    "seed": {"path": "llvm/test/CodeGen/DLC/example.ll"},
+    "profile": {"name": "example"},
+  }
+  auth_path = tmp_path / "auth.json"
+  config_path = tmp_path / "config.toml"
+  auth_path.write_text('{"OPENAI_API_KEY": "sk-codex-full-file"}\n', encoding="utf-8")
+  config_path.write_text(
+    """
+model_provider = "openrouter"
+model = "gpt-5.5"
+
+[model_providers.openrouter]
+base_url = "https://openrouter.example.test/v1"
+
+[notice.model_migrations]
+"gpt-5.5" = "openai/gpt-5.5"
+""",
+    encoding="utf-8",
+  )
+
+  class FakeResponse:
+    def __enter__(self):
+      return self
+
+    def __exit__(self, *_):
+      return None
+
+    def read(self):
+      return json.dumps(
+        {
+          "choices": [
+            {
+              "message": {
+                "content": json.dumps(
+                  {
+                    "seed": "llvm/test/CodeGen/DLC/example.ll",
+                    "profile": "example",
+                    "candidates": [
+                      {
+                        "filename": "example-agent-0.ll",
+                        "text": "define void @example() { ret void }\n",
+                        "rationale": "complete candidate",
+                        "intended_stress": "stress point",
+                      }
+                    ],
+                  }
+                )
+              }
+            }
+          ]
+        }
+      ).encode("utf-8")
+
+  def fake_urlopen(request, timeout):
+    captured["url"] = request.full_url
+    captured["headers"] = dict(request.header_items())
+    captured["payload"] = json.loads(request.data.decode("utf-8"))
+    captured["timeout"] = timeout
+    return FakeResponse()
+
+  for name in [
+    "DLC_TESTFORGE_LM_API_KEY",
+    "DLC_TESTFORGE_LM_API_ENDPOINT",
+    "DLC_TESTFORGE_LM_MODEL",
+    "LLVM_HARNESS_LM_API_KEY",
+    "LLVM_HARNESS_LM_API_ENDPOINT",
+    "LLVM_HARNESS_LM_MODEL",
+  ]:
+    monkeypatch.delenv(name, raising=False)
+  monkeypatch.setattr("dlc_testforge.agent.CODEX_AUTH_PATH", auth_path)
+  monkeypatch.setattr("dlc_testforge.agent.CODEX_CONFIG_PATH", config_path)
+  monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+  proposal = request_agent_full_file_proposal(context)
+
+  assert proposal.candidates[0].filename == "example-agent-0.ll"
+  assert captured["url"] == "https://openrouter.example.test/v1/chat/completions"
+  assert captured["payload"]["model"] == "openai/gpt-5.5"
+  assert captured["payload"]["temperature"] == 0
+  assert captured["timeout"] == 120
+  assert captured["headers"]["Authorization"] == "Bearer sk-codex-full-file"
+
+
+def test_request_agent_full_file_proposal_rejects_malformed_response(monkeypatch):
+  context = {
+    "seed": {"path": "llvm/test/CodeGen/DLC/example.ll"},
+    "profile": {"name": "example"},
+  }
+
+  class FakeResponse:
+    def __enter__(self):
+      return self
+
+    def __exit__(self, *_):
+      return None
+
+    def read(self):
+      return json.dumps({"choices": []}).encode("utf-8")
+
+  def fake_urlopen(_request, timeout):
+    return FakeResponse()
+
+  monkeypatch.delenv("DLC_TESTFORGE_LM_API_KEY", raising=False)
+  monkeypatch.delenv("DLC_TESTFORGE_LM_API_ENDPOINT", raising=False)
+  monkeypatch.delenv("DLC_TESTFORGE_LM_MODEL", raising=False)
+  monkeypatch.setenv("LLVM_HARNESS_LM_API_KEY", "sk-full-file-test")
+  monkeypatch.setenv("LLVM_HARNESS_LM_API_ENDPOINT", "https://example.test/v1")
+  monkeypatch.setenv("LLVM_HARNESS_LM_MODEL", "test-full-file-model")
+  monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+  try:
+    request_agent_full_file_proposal(context)
+  except ValueError as exc:
+    assert (
+      "agent full-file response did not contain choices[0].message.content"
+      in str(exc)
+    )
+  else:
+    raise AssertionError("expected ValueError")
 
 
 def test_select_kernel_evidence_prefers_machine_addropt_address_records():
