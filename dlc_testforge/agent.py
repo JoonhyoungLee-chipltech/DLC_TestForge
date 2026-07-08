@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -191,6 +192,79 @@ def build_agent_context(
       "text": seed_text,
       "index_record": seed_record,
     },
+    "profile": profile.to_dict(),
+    "spec_records": _select_spec_records(spec_index, profile.spec_sources),
+    "source_records": _select_source_records(td_index, profile.source_files),
+    "td_summary": (td_index or {}).get("summary", {}),
+    "mutation_budget": max_candidates,
+    "guardrails": guardrails,
+  }
+  if kernel_usage_evidence is not None:
+    context["kernel_usage_evidence"] = kernel_usage_evidence
+  return context
+
+
+def build_full_file_agent_context(
+  profile: MutationProfile,
+  seed_relative: str,
+  seed_text: str,
+  max_candidates: int,
+  *,
+  llvm_root: Path,
+  test_index: dict[str, Any] | None = None,
+  spec_index: dict[str, Any] | None = None,
+  td_index: dict[str, Any] | None = None,
+  kernel_usage_evidence: dict[str, Any] | None = None,
+  nearby_test_limit: int = 4,
+) -> dict[str, Any]:
+  seed_path = Path(seed_relative)
+  seed_directory = seed_path.parent.as_posix()
+  if seed_directory == ".":
+    seed_directory = ""
+  guardrails = [
+    "Preserve the seed test's pass workflow unless the rationale explains a narrow variation.",
+    "Keep RUN lines valid for the active profile.",
+    "Write complete .ll files, not patches.",
+    "Do not invent DLC intrinsics, instructions, address spaces, or datalayouts.",
+    "Prefer patterns supported by the seed, specs, backend source, or kernel evidence.",
+    "Each candidate must target one stress point.",
+    "Do not output Markdown fences.",
+    "Validation and classification are authoritative.",
+  ]
+  context = {
+    "task": "write_dlc_full_file_test_mutations",
+    "contract": {
+      "role": "write complete candidate .ll files only",
+      "output_format": "json",
+      "required_top_level_fields": [
+        "seed",
+        "profile",
+        "candidates",
+      ],
+      "required_candidate_fields": [
+        "filename",
+        "text",
+        "rationale",
+        "intended_stress",
+      ],
+      "optional_candidate_fields": [
+        "evidence_tags",
+        "source_evidence",
+      ],
+    },
+    "seed": {
+      "path": seed_relative,
+      "directory": seed_directory,
+      "text": seed_text,
+      "run_lines": _extract_run_lines(seed_text),
+      "check_prefixes": _extract_check_prefixes(seed_text),
+      "index_record": _find_seed_record(test_index, seed_relative),
+    },
+    "nearby_tests": _select_nearby_tests(
+      llvm_root,
+      seed_relative,
+      nearby_test_limit,
+    ),
     "profile": profile.to_dict(),
     "spec_records": _select_spec_records(spec_index, profile.spec_sources),
     "source_records": _select_source_records(td_index, profile.source_files),
@@ -834,6 +908,65 @@ def _find_seed_record(
     if isinstance(record, dict) and record.get("path") == seed_relative:
       return record
   return None
+
+
+def _extract_run_lines(text: str) -> list[str]:
+  return [
+    line.strip()
+    for line in text.splitlines()
+    if re.match(r"^\s*[;#]\s*RUN:", line)
+  ]
+
+
+def _extract_check_prefixes(text: str) -> list[str]:
+  prefixes = []
+  seen = set()
+  for line in text.splitlines():
+    match = re.match(r"^\s*[;#]\s*([A-Za-z0-9_.$-]*CHECK[A-Za-z0-9_.$-]*):", line)
+    if match is None:
+      continue
+    prefix = match.group(1)
+    if prefix in seen:
+      continue
+    seen.add(prefix)
+    prefixes.append(prefix)
+  return prefixes
+
+
+def _select_nearby_tests(
+  llvm_root: Path,
+  seed_relative: str,
+  limit: int,
+) -> list[dict[str, Any]]:
+  limit = max(limit, 0)
+  if limit == 0:
+    return []
+  seed_path = Path(seed_relative)
+  seed_directory = llvm_root / seed_path.parent
+  if not seed_directory.is_dir():
+    return []
+
+  records = []
+  for path in sorted(seed_directory.glob("*.ll")):
+    relative_path = path.relative_to(llvm_root).as_posix()
+    if relative_path == seed_relative:
+      continue
+    text = path.read_text(encoding="utf-8", errors="replace")
+    records.append(
+      {
+        "path": relative_path,
+        "run_lines": _extract_run_lines(text),
+        "text": _nearby_test_preview(text),
+      }
+    )
+    if len(records) >= limit:
+      break
+  return records
+
+
+def _nearby_test_preview(text: str) -> str:
+  preview = "".join(text.splitlines(keepends=True)[:80])
+  return preview[:12000]
 
 
 def _kernel_evidence_score(record: dict[str, Any], profile_name: str) -> int:

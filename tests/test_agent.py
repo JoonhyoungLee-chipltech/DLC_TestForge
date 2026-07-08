@@ -4,6 +4,7 @@ import json
 
 from dlc_testforge.agent import (
   build_agent_context,
+  build_full_file_agent_context,
   filter_agent_mutations,
   load_agent_full_file_proposal,
   parse_agent_full_file_proposal,
@@ -11,8 +12,13 @@ from dlc_testforge.agent import (
   request_agent_proposal,
   select_kernel_evidence,
 )
-from dlc_testforge.profiles import get_profile
+from dlc_testforge.profiles import MutationProfile, get_profile
 from tests.test_generate import _make_profiles_dir
+
+
+def _write_text(path, text):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(text, encoding="utf-8")
 
 
 def _kernel_record(
@@ -61,6 +67,223 @@ def _kernel_record(
   if extra:
     record.update(extra)
   return record
+
+
+def test_build_full_file_agent_context_includes_seed_details(tmp_path):
+  profiles_dir = _make_profiles_dir(tmp_path)
+  profile = get_profile("example", profiles_dir)
+  llvm_root = tmp_path / "LLVM"
+  seed_relative = "llvm/test/CodeGen/DLC/example.ll"
+  seed_text = """; RUN: llc -mtriple=dlc < %s | FileCheck %s
+; CHECK-LABEL: example
+; CHECK: S_ADD
+; CHECK: S_RET
+define i32 @example(i32 %x) {
+  ret i32 %x
+}
+"""
+  _write_text(llvm_root / seed_relative, seed_text)
+  test_index = {
+    "tests": [
+      {
+        "path": seed_relative,
+        "kind": "ll",
+        "features": ["llc"],
+      }
+    ]
+  }
+
+  context = build_full_file_agent_context(
+    profile,
+    seed_relative,
+    seed_text,
+    3,
+    llvm_root=llvm_root,
+    test_index=test_index,
+  )
+
+  assert context["task"] == "write_dlc_full_file_test_mutations"
+  assert context["contract"]["required_top_level_fields"] == [
+    "seed",
+    "profile",
+    "candidates",
+  ]
+  assert context["seed"]["path"] == seed_relative
+  assert context["seed"]["directory"] == "llvm/test/CodeGen/DLC"
+  assert context["seed"]["text"] == seed_text
+  assert context["seed"]["run_lines"] == [
+    "; RUN: llc -mtriple=dlc < %s | FileCheck %s"
+  ]
+  assert context["seed"]["check_prefixes"] == [
+    "CHECK-LABEL",
+    "CHECK",
+  ]
+  assert context["seed"]["index_record"] == test_index["tests"][0]
+  assert context["profile"]["name"] == "example"
+  assert context["mutation_budget"] == 3
+  assert any("complete .ll files" in guardrail for guardrail in context["guardrails"])
+
+
+def test_build_full_file_agent_context_selects_nearby_tests(tmp_path):
+  profiles_dir = _make_profiles_dir(tmp_path)
+  profile = get_profile("example", profiles_dir)
+  llvm_root = tmp_path / "LLVM"
+  seed_relative = "llvm/test/CodeGen/DLC/example.ll"
+  seed_text = "; RUN: llc < %s\n; CHECK: seed\n"
+  _write_text(llvm_root / seed_relative, seed_text)
+  _write_text(
+    llvm_root / "llvm/test/CodeGen/DLC/a-nearby.ll",
+    "; RUN: llc < %s\n; CHECK: nearby-a\n",
+  )
+  _write_text(
+    llvm_root / "llvm/test/CodeGen/DLC/z-nearby.ll",
+    "; RUN: llc < %s\n; CHECK: nearby-z\n",
+  )
+  _write_text(
+    llvm_root / "llvm/test/CodeGen/DLC/other.txt",
+    "; RUN: should not be selected\n",
+  )
+  _write_text(
+    llvm_root / "llvm/test/CodeGen/DLC/subdir/nested.ll",
+    "; RUN: should not be selected\n",
+  )
+
+  context = build_full_file_agent_context(
+    profile,
+    seed_relative,
+    seed_text,
+    2,
+    llvm_root=llvm_root,
+    nearby_test_limit=1,
+  )
+
+  assert context["nearby_tests"] == [
+    {
+      "path": "llvm/test/CodeGen/DLC/a-nearby.ll",
+      "run_lines": ["; RUN: llc < %s"],
+      "text": "; RUN: llc < %s\n; CHECK: nearby-a\n",
+    }
+  ]
+
+
+def test_build_full_file_agent_context_caps_nearby_preview(tmp_path):
+  profiles_dir = _make_profiles_dir(tmp_path)
+  profile = get_profile("example", profiles_dir)
+  llvm_root = tmp_path / "LLVM"
+  seed_relative = "llvm/test/CodeGen/DLC/example.ll"
+  seed_text = "; RUN: llc < %s\n"
+  long_nearby_text = "".join(f"; CHECK: line {index}\n" for index in range(100))
+  _write_text(llvm_root / seed_relative, seed_text)
+  _write_text(llvm_root / "llvm/test/CodeGen/DLC/nearby.ll", long_nearby_text)
+
+  context = build_full_file_agent_context(
+    profile,
+    seed_relative,
+    seed_text,
+    2,
+    llvm_root=llvm_root,
+  )
+
+  assert context["nearby_tests"][0]["text"] == "".join(
+    long_nearby_text.splitlines(keepends=True)[:80]
+  )
+
+  very_long_line = "; CHECK: " + ("x" * 13000) + "\n"
+  _write_text(llvm_root / "llvm/test/CodeGen/DLC/a-long.ll", very_long_line)
+  context = build_full_file_agent_context(
+    profile,
+    seed_relative,
+    seed_text,
+    2,
+    llvm_root=llvm_root,
+    nearby_test_limit=1,
+  )
+
+  assert len(context["nearby_tests"][0]["text"]) == 12000
+
+
+def test_build_full_file_agent_context_optional_kernel_evidence(tmp_path):
+  profiles_dir = _make_profiles_dir(tmp_path)
+  profile = get_profile("example", profiles_dir)
+  llvm_root = tmp_path / "LLVM"
+  seed_relative = "llvm/test/CodeGen/DLC/example.ll"
+  seed_text = "; RUN: llc < %s\n"
+  evidence = {
+    "selection": {"selected_count": 1},
+    "kernels": [{"name": "custom_kernel"}],
+  }
+  _write_text(llvm_root / seed_relative, seed_text)
+
+  base_context = build_full_file_agent_context(
+    profile,
+    seed_relative,
+    seed_text,
+    2,
+    llvm_root=llvm_root,
+  )
+  context = build_full_file_agent_context(
+    profile,
+    seed_relative,
+    seed_text,
+    2,
+    llvm_root=llvm_root,
+    kernel_usage_evidence=evidence,
+  )
+
+  assert "kernel_usage_evidence" not in base_context
+  assert context["kernel_usage_evidence"] == evidence
+
+
+def test_build_full_file_agent_context_reuses_spec_and_source_selectors(tmp_path):
+  profile = MutationProfile(
+    name="example",
+    description="Example profile.",
+    seed_selectors={"paths": ["llvm/test/CodeGen/DLC/example.ll"]},
+    commands={"base": ["{llc} {input}"]},
+    validation={"required_levels": ["syntax"]},
+    mutation_axes={},
+    bug_scout={"enabled": False},
+    source_files=["llvm/lib/Target/DLC/Selected.cpp"],
+    spec_sources=["docs/dlc_spec/selected.md"],
+  )
+  llvm_root = tmp_path / "LLVM"
+  seed_relative = "llvm/test/CodeGen/DLC/example.ll"
+  seed_text = "; RUN: llc < %s\n"
+  _write_text(llvm_root / seed_relative, seed_text)
+  spec_index = {
+    "records": [
+      {"source": "docs/dlc_spec/selected.md", "text": "selected"},
+      {"source": "docs/dlc_spec/other.md", "text": "other"},
+    ]
+  }
+  td_index = {
+    "summary": {"source_count": 2},
+    "intrinsics": [
+      {"source": "llvm/lib/Target/DLC/Selected.cpp", "name": "selected"},
+      {"source": "llvm/lib/Target/DLC/Other.cpp", "name": "other"},
+    ],
+    "builtins": [],
+    "instructions": [],
+    "references": [],
+  }
+
+  context = build_full_file_agent_context(
+    profile,
+    seed_relative,
+    seed_text,
+    2,
+    llvm_root=llvm_root,
+    spec_index=spec_index,
+    td_index=td_index,
+  )
+
+  assert context["spec_records"] == [
+    {"source": "docs/dlc_spec/selected.md", "text": "selected"}
+  ]
+  assert context["source_records"]["intrinsics"] == [
+    {"source": "llvm/lib/Target/DLC/Selected.cpp", "name": "selected"}
+  ]
+  assert context["td_summary"] == {"source_count": 2}
 
 
 def test_parse_agent_full_file_proposal_preserves_valid_candidate(tmp_path):
