@@ -5,6 +5,8 @@ import json
 from dlc_testforge.agent import (
   build_agent_context,
   filter_agent_mutations,
+  load_agent_full_file_proposal,
+  parse_agent_full_file_proposal,
   parse_agent_proposal,
   request_agent_proposal,
   select_kernel_evidence,
@@ -59,6 +61,319 @@ def _kernel_record(
   if extra:
     record.update(extra)
   return record
+
+
+def test_parse_agent_full_file_proposal_preserves_valid_candidate(tmp_path):
+  proposal_path = tmp_path / "proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "candidates": [
+          {
+            "filename": "example_agent_0.ll",
+            "text": "define void @example() {\n  ret void\n}\n",
+            "rationale": "keep the IR minimal while exercising the path",
+            "intended_stress": "baseline parser acceptance",
+            "evidence_tags": ["addr_exp_boundary"],
+            "source_evidence": "kernel evidence mentions address boundaries",
+          },
+          {
+            "filename": "example_agent_1.ll",
+            "text": "define void @example2() {\n  ret void\n}\n",
+            "rationale": "empty metadata should be omitted",
+            "intended_stress": "metadata serialization",
+            "evidence_tags": [],
+            "source_evidence": "",
+          },
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  proposal = load_agent_full_file_proposal(
+    proposal_path,
+    seed_relative="llvm/test/CodeGen/DLC/example.ll",
+    profile_name="example",
+  )
+
+  assert proposal.seed == "llvm/test/CodeGen/DLC/example.ll"
+  assert proposal.profile == "example"
+  assert proposal.candidates[0].filename == "example_agent_0.ll"
+  assert proposal.candidates[0].evidence_tags == ["addr_exp_boundary"]
+  assert proposal.to_dict() == {
+    "seed": "llvm/test/CodeGen/DLC/example.ll",
+    "profile": "example",
+    "candidates": [
+      {
+        "filename": "example_agent_0.ll",
+        "text": "define void @example() {\n  ret void\n}\n",
+        "rationale": "keep the IR minimal while exercising the path",
+        "intended_stress": "baseline parser acceptance",
+        "evidence_tags": ["addr_exp_boundary"],
+        "source_evidence": "kernel evidence mentions address boundaries",
+      },
+      {
+        "filename": "example_agent_1.ll",
+        "text": "define void @example2() {\n  ret void\n}\n",
+        "rationale": "empty metadata should be omitted",
+        "intended_stress": "metadata serialization",
+      },
+    ],
+  }
+
+
+def test_parse_agent_full_file_proposal_accepts_json_fence():
+  proposal = parse_agent_full_file_proposal(
+    """```json
+{
+  "seed": "llvm/test/CodeGen/DLC/example.ll",
+  "profile": "example",
+  "candidates": [
+    {
+      "filename": "example_agent_0.ll",
+      "text": "define void @example() { ret void }\\n",
+      "rationale": "exercise full-file proposal parsing",
+      "intended_stress": "JSON fence handling"
+    }
+  ]
+}
+```"""
+  )
+
+  assert proposal.candidates[0].filename == "example_agent_0.ll"
+  assert proposal.candidates[0].text == "define void @example() { ret void }\n"
+
+
+def test_parse_agent_full_file_proposal_rejects_seed_and_profile_mismatch():
+  base = {
+    "seed": "llvm/test/CodeGen/DLC/example.ll",
+    "profile": "example",
+    "candidates": [
+      {
+        "filename": "example_agent_0.ll",
+        "text": "define void @example() { ret void }\n",
+        "rationale": "valid candidate",
+        "intended_stress": "valid candidate",
+      }
+    ],
+  }
+
+  try:
+    parse_agent_full_file_proposal(
+      json.dumps(base),
+      seed_relative="llvm/test/CodeGen/DLC/other.ll",
+      profile_name="example",
+    )
+  except ValueError as exc:
+    assert "does not match requested seed" in str(exc)
+  else:
+    raise AssertionError("expected ValueError")
+
+  try:
+    parse_agent_full_file_proposal(
+      json.dumps(base),
+      seed_relative="llvm/test/CodeGen/DLC/example.ll",
+      profile_name="other",
+    )
+  except ValueError as exc:
+    assert "does not match requested profile" in str(exc)
+  else:
+    raise AssertionError("expected ValueError")
+
+
+def test_parse_agent_full_file_proposal_rejects_unsafe_filename():
+  invalid_filenames = [
+    "../bad.ll",
+    "bad/seed.ll",
+    "bad\\seed.ll",
+    "/tmp/bad.ll",
+    "bad.txt",
+    "bad..ll",
+  ]
+
+  for filename in invalid_filenames:
+    try:
+      parse_agent_full_file_proposal(
+        json.dumps(
+          {
+            "seed": "llvm/test/CodeGen/DLC/example.ll",
+            "profile": "example",
+            "candidates": [
+              {
+                "filename": filename,
+                "text": "define void @example() { ret void }\n",
+                "rationale": "valid candidate",
+                "intended_stress": "valid candidate",
+              }
+            ],
+          }
+        )
+      )
+    except ValueError as exc:
+      assert "filename" in str(exc)
+    else:
+      raise AssertionError("expected ValueError")
+
+
+def test_parse_agent_full_file_proposal_rejects_required_candidate_fields():
+  base_candidate = {
+    "filename": "example_agent_0.ll",
+    "text": "define void @example() { ret void }\n",
+    "rationale": "valid candidate",
+    "intended_stress": "valid candidate",
+  }
+  invalid_fields = [
+    ("filename", ""),
+    ("filename", 7),
+    ("text", ""),
+    ("text", 7),
+    ("text", "```llvm\ndefine void @example() { ret void }\n```"),
+    ("rationale", ""),
+    ("rationale", 7),
+    ("intended_stress", ""),
+    ("intended_stress", 7),
+  ]
+
+  for field, value in invalid_fields:
+    candidate = {**base_candidate, field: value}
+    try:
+      parse_agent_full_file_proposal(
+        json.dumps(
+          {
+            "seed": "llvm/test/CodeGen/DLC/example.ll",
+            "profile": "example",
+            "candidates": [candidate],
+          }
+        )
+      )
+    except ValueError as exc:
+      assert field in str(exc)
+    else:
+      raise AssertionError("expected ValueError")
+
+
+def test_parse_agent_full_file_proposal_rejects_malformed_metadata():
+  base_candidate = {
+    "filename": "example_agent_0.ll",
+    "text": "define void @example() { ret void }\n",
+    "rationale": "valid candidate",
+    "intended_stress": "valid candidate",
+  }
+  invalid_metadata = [
+    {"evidence_tags": "addr_exp_boundary"},
+    {"evidence_tags": ["addr_exp_boundary", 7]},
+    {"evidence_tags": {"kind": "addr_exp_boundary"}},
+    {"source_evidence": ["not", "a", "string"]},
+  ]
+
+  for metadata in invalid_metadata:
+    candidate = {**base_candidate, **metadata}
+    try:
+      parse_agent_full_file_proposal(
+        json.dumps(
+          {
+            "seed": "llvm/test/CodeGen/DLC/example.ll",
+            "profile": "example",
+            "candidates": [candidate],
+          }
+        )
+      )
+    except ValueError as exc:
+      assert "evidence" in str(exc)
+    else:
+      raise AssertionError("expected ValueError")
+
+
+def test_parse_agent_full_file_proposal_rejects_duplicate_text():
+  try:
+    parse_agent_full_file_proposal(
+      json.dumps(
+        {
+          "seed": "llvm/test/CodeGen/DLC/example.ll",
+          "profile": "example",
+          "candidates": [
+            {
+              "filename": "example_agent_0.ll",
+              "text": "define void @example() { ret void }\n",
+              "rationale": "first candidate",
+              "intended_stress": "first candidate",
+            },
+            {
+              "filename": "example_agent_1.ll",
+              "text": "define void @example() { ret void }\n",
+              "rationale": "duplicate candidate",
+              "intended_stress": "duplicate candidate",
+            },
+          ],
+        }
+      )
+    )
+  except ValueError as exc:
+    assert "duplicates" in str(exc)
+  else:
+    raise AssertionError("expected ValueError")
+
+
+def test_parse_agent_full_file_proposal_caps_after_validation():
+  proposal = parse_agent_full_file_proposal(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "candidates": [
+          {
+            "filename": "example_agent_0.ll",
+            "text": "define void @example0() { ret void }\n",
+            "rationale": "first candidate",
+            "intended_stress": "first candidate",
+          },
+          {
+            "filename": "example_agent_1.ll",
+            "text": "define void @example1() { ret void }\n",
+            "rationale": "second candidate",
+            "intended_stress": "second candidate",
+          },
+        ],
+      }
+    ),
+    max_candidates=1,
+  )
+
+  assert [candidate.filename for candidate in proposal.candidates] == [
+    "example_agent_0.ll"
+  ]
+
+  try:
+    parse_agent_full_file_proposal(
+      json.dumps(
+        {
+          "seed": "llvm/test/CodeGen/DLC/example.ll",
+          "profile": "example",
+          "candidates": [
+            {
+              "filename": "example_agent_0.ll",
+              "text": "define void @example0() { ret void }\n",
+              "rationale": "first candidate",
+              "intended_stress": "first candidate",
+            },
+            {
+              "filename": "../bad.ll",
+              "text": "define void @example1() { ret void }\n",
+              "rationale": "invalid candidate after cap",
+              "intended_stress": "invalid candidate after cap",
+            },
+          ],
+        }
+      ),
+      max_candidates=1,
+    )
+  except ValueError as exc:
+    assert "filename" in str(exc)
+  else:
+    raise AssertionError("expected ValueError")
 
 
 def test_parse_agent_proposal_accepts_json_fence():

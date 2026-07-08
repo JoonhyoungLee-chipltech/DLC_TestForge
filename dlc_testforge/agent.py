@@ -91,6 +91,43 @@ class AgentProposal:
 
 
 @dataclass(frozen=True)
+class AgentFullFileCandidate:
+  filename: str
+  text: str
+  rationale: str
+  intended_stress: str
+  evidence_tags: list[str] | None = None
+  source_evidence: str | None = None
+
+  def to_dict(self) -> dict[str, Any]:
+    data = {
+      "filename": self.filename,
+      "text": self.text,
+      "rationale": self.rationale,
+      "intended_stress": self.intended_stress,
+    }
+    if self.evidence_tags:
+      data["evidence_tags"] = self.evidence_tags
+    if self.source_evidence:
+      data["source_evidence"] = self.source_evidence
+    return data
+
+
+@dataclass(frozen=True)
+class AgentFullFileProposal:
+  seed: str
+  profile: str
+  candidates: list[AgentFullFileCandidate]
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "seed": self.seed,
+      "profile": self.profile,
+      "candidates": [candidate.to_dict() for candidate in self.candidates],
+    }
+
+
+@dataclass(frozen=True)
 class RejectedAgentMutation:
   index: int
   mutation: dict[str, Any]
@@ -230,6 +267,22 @@ def load_agent_proposal(path: Path) -> AgentProposal:
   return parse_agent_proposal(text)
 
 
+def load_agent_full_file_proposal(
+  path: Path,
+  *,
+  seed_relative: str | None = None,
+  profile_name: str | None = None,
+  max_candidates: int | None = None,
+) -> AgentFullFileProposal:
+  text = path.expanduser().read_text(encoding="utf-8")
+  return parse_agent_full_file_proposal(
+    text,
+    seed_relative=seed_relative,
+    profile_name=profile_name,
+    max_candidates=max_candidates,
+  )
+
+
 def request_agent_proposal(
   context: dict[str, Any],
   *,
@@ -365,6 +418,59 @@ def parse_agent_proposal(text: str) -> AgentProposal:
   for index, item in enumerate(proposed):
     mutations.append(_parse_mutation(index, item))
   return AgentProposal(seed=seed, profile=profile, proposed_mutations=mutations)
+
+
+def parse_agent_full_file_proposal(
+  text: str,
+  *,
+  seed_relative: str | None = None,
+  profile_name: str | None = None,
+  max_candidates: int | None = None,
+) -> AgentFullFileProposal:
+  data = _loads_json_object(text)
+  if not isinstance(data, dict):
+    raise ValueError("agent full-file proposal must be a JSON object")
+
+  seed = data.get("seed")
+  profile = data.get("profile")
+  candidates_data = data.get("candidates")
+  if not isinstance(seed, str) or not seed.strip():
+    raise ValueError(
+      "agent full-file proposal field seed must be a non-empty string"
+    )
+  if not isinstance(profile, str) or not profile.strip():
+    raise ValueError(
+      "agent full-file proposal field profile must be a non-empty string"
+    )
+  if seed_relative is not None and seed != seed_relative:
+    raise ValueError(
+      f"agent full-file proposal seed {seed} does not match requested seed {seed_relative}"
+    )
+  if profile_name is not None and profile != profile_name:
+    raise ValueError(
+      f"agent full-file proposal profile {profile} does not match requested profile {profile_name}"
+    )
+  if not isinstance(candidates_data, list):
+    raise ValueError("agent full-file proposal field candidates must be a list")
+  if max_candidates is not None and (
+    not isinstance(max_candidates, int)
+    or isinstance(max_candidates, bool)
+    or max_candidates < 0
+  ):
+    raise ValueError("max_candidates must be a non-negative integer")
+
+  candidates = []
+  seen_texts = set()
+  for index, item in enumerate(candidates_data):
+    candidate = _parse_full_file_candidate(index, item)
+    if candidate.text in seen_texts:
+      raise ValueError(f"candidates[{index}].text duplicates an earlier candidate")
+    seen_texts.add(candidate.text)
+    candidates.append(candidate)
+
+  if max_candidates is not None:
+    candidates = candidates[:max_candidates]
+  return AgentFullFileProposal(seed=seed, profile=profile, candidates=candidates)
 
 
 def filter_agent_mutations(
@@ -555,6 +661,75 @@ def _parse_mutation(index: int, item: Any) -> AgentMutationProposal:
     evidence_tags=evidence_tags,
     source_evidence=source_evidence,
   )
+
+
+def _parse_full_file_candidate(index: int, item: Any) -> AgentFullFileCandidate:
+  if not isinstance(item, dict):
+    raise ValueError(f"candidates[{index}] must be a JSON object")
+  filename = item.get("filename")
+  text = item.get("text")
+  rationale = item.get("rationale")
+  intended_stress = item.get("intended_stress")
+  if not isinstance(filename, str) or not _is_safe_ll_filename(filename):
+    raise ValueError(
+      f"candidates[{index}].filename must be a safe .ll basename"
+    )
+  if not isinstance(text, str) or not text.strip():
+    raise ValueError(f"candidates[{index}].text must be a non-empty string")
+  if "```" in text:
+    raise ValueError(f"candidates[{index}].text must not contain Markdown fences")
+  if not isinstance(rationale, str) or not rationale.strip():
+    raise ValueError(f"candidates[{index}].rationale must be a non-empty string")
+  if not isinstance(intended_stress, str) or not intended_stress.strip():
+    raise ValueError(
+      f"candidates[{index}].intended_stress must be a non-empty string"
+    )
+  evidence_tags = _parse_candidate_evidence_tags(index, item.get("evidence_tags"))
+  source_evidence = _parse_candidate_source_evidence(
+    index, item.get("source_evidence")
+  )
+  return AgentFullFileCandidate(
+    filename=filename,
+    text=text,
+    rationale=rationale,
+    intended_stress=intended_stress,
+    evidence_tags=evidence_tags,
+    source_evidence=source_evidence,
+  )
+
+
+def _is_safe_ll_filename(filename: str) -> bool:
+  return (
+    bool(filename)
+    and filename.endswith(".ll")
+    and "/" not in filename
+    and "\\" not in filename
+    and ".." not in filename
+    and not os.path.isabs(filename)
+  )
+
+
+def _parse_candidate_evidence_tags(index: int, value: Any) -> list[str] | None:
+  if value is None:
+    return None
+  if not isinstance(value, list):
+    raise ValueError(
+      f"candidates[{index}].evidence_tags must be a list of strings"
+    )
+  for tag_index, tag in enumerate(value):
+    if not isinstance(tag, str):
+      raise ValueError(
+        f"candidates[{index}].evidence_tags[{tag_index}] must be a string"
+      )
+  return value or None
+
+
+def _parse_candidate_source_evidence(index: int, value: Any) -> str | None:
+  if value is None:
+    return None
+  if not isinstance(value, str):
+    raise ValueError(f"candidates[{index}].source_evidence must be a string")
+  return value or None
 
 
 def _parse_evidence_tags(index: int, value: Any) -> list[str] | None:
