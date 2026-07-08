@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import json
 
+from dlc_testforge.agent import AgentFullFileCandidate
 from dlc_testforge.cli import main
-from dlc_testforge.generate import create_workspace
+from dlc_testforge.generate import (
+  RejectedFullFileCandidate,
+  _full_file_rejection_reason,
+  create_workspace,
+)
 
 
 def _write(path, text):
@@ -105,6 +110,181 @@ def _write_kernel_usage_index(tmp_path):
     encoding="utf-8",
   )
   return path
+
+
+def _full_file_candidate(text):
+  return AgentFullFileCandidate(
+    filename="candidate.ll",
+    text=text,
+    rationale="test candidate",
+    intended_stress="test stress",
+  )
+
+
+def test_full_file_quality_gate_accepts_candidate():
+  candidate = _full_file_candidate(
+    """; RUN: llc -mtriple=dlc < %s | FileCheck %s
+define void @candidate() {
+  ret void
+}
+"""
+  )
+
+  assert (
+    _full_file_rejection_reason(
+      candidate,
+      seed_text="; RUN: llc < %s\n",
+      seen_texts=set(),
+    )
+    is None
+  )
+
+
+def test_full_file_quality_gate_rejects_empty_text():
+  assert _full_file_rejection_reason(
+    _full_file_candidate("  \n"),
+    seed_text="; RUN: llc < %s\n",
+    seen_texts=set(),
+  ) == "empty candidate text"
+
+
+def test_full_file_quality_gate_rejects_markdown_fences():
+  assert _full_file_rejection_reason(
+    _full_file_candidate(
+      """```llvm
+; RUN: llc < %s
+define void @candidate() { ret void }
+```"""
+    ),
+    seed_text="; RUN: llc < %s\n",
+    seen_texts=set(),
+  ) == "candidate text contains Markdown fences"
+
+
+def test_full_file_quality_gate_rejects_seed_duplicate():
+  seed_text = """; RUN: llc < %s
+define void @seed() {
+  ret void
+}
+"""
+
+  assert _full_file_rejection_reason(
+    _full_file_candidate(seed_text),
+    seed_text=seed_text,
+    seen_texts=set(),
+  ) == "candidate is identical to seed"
+
+
+def test_full_file_quality_gate_rejects_duplicate_candidate_text():
+  text = """; RUN: llc < %s
+define void @candidate() {
+  ret void
+}
+"""
+
+  assert _full_file_rejection_reason(
+    _full_file_candidate(text),
+    seed_text="; RUN: llc < %s\ndefine void @seed() { ret void }\n",
+    seen_texts={text.strip()},
+  ) == "duplicate candidate text"
+
+
+def test_full_file_quality_gate_does_not_mutate_seen_texts():
+  text = """; RUN: llc < %s
+define void @candidate() {
+  ret void
+}
+"""
+  seen_texts = set()
+
+  assert _full_file_rejection_reason(
+    _full_file_candidate(text),
+    seed_text="; RUN: llc < %s\ndefine void @seed() { ret void }\n",
+    seen_texts=seen_texts,
+  ) is None
+  assert seen_texts == set()
+
+
+def test_full_file_quality_gate_rejects_missing_run_line():
+  assert _full_file_rejection_reason(
+    _full_file_candidate("define void @candidate() { ret void }\n"),
+    seed_text="; RUN: llc < %s\n",
+    seen_texts=set(),
+  ) == "missing RUN line"
+
+
+def test_full_file_quality_gate_rejects_oversized_candidate():
+  candidate_text = (
+    "; RUN: llc < %s\n"
+    "define void @candidate() { ret void }\n"
+    + ("; filler\n" * 3000)
+  )
+
+  assert _full_file_rejection_reason(
+    _full_file_candidate(candidate_text),
+    seed_text="; RUN: llc < %s\ndefine void @seed() { ret void }\n",
+    seen_texts=set(),
+  ) == "candidate is too large"
+
+
+def test_full_file_quality_gate_rejects_missing_define_line():
+  assert _full_file_rejection_reason(
+    _full_file_candidate("; RUN: llc < %s\n; CHECK: nothing\n"),
+    seed_text="; RUN: llc < %s\n",
+    seen_texts=set(),
+  ) == "missing define line"
+
+
+def test_full_file_quality_gate_rejects_removed_target_triple():
+  seed_text = """target triple = "dlc"
+; RUN: llc < %s
+define void @seed() {
+  ret void
+}
+"""
+
+  assert _full_file_rejection_reason(
+    _full_file_candidate(
+      """; RUN: llc < %s
+define void @candidate() {
+  ret void
+}
+"""
+    ),
+    seed_text=seed_text,
+    seen_texts=set(),
+  ) == "candidate removed seed target triple"
+
+
+def test_full_file_quality_gate_allows_missing_target_triple_when_seed_has_none():
+  candidate = _full_file_candidate(
+    """; RUN: llc < %s
+define void @candidate() {
+  ret void
+}
+"""
+  )
+
+  assert _full_file_rejection_reason(
+    candidate,
+    seed_text="; RUN: llc < %s\ndefine void @seed() { ret void }\n",
+    seen_texts=set(),
+  ) is None
+
+
+def test_rejected_full_file_candidate_to_dict_preserves_fields():
+  candidate = _full_file_candidate("bad\n").to_dict()
+  rejection = RejectedFullFileCandidate(
+    index=2,
+    candidate=candidate,
+    reason="missing RUN line",
+  )
+
+  assert rejection.to_dict() == {
+    "index": 2,
+    "candidate": candidate,
+    "reason": "missing RUN line",
+  }
 
 
 def test_dry_run_creates_workspace_snapshots_and_no_candidates(tmp_path):

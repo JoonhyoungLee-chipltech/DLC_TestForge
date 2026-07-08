@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from dlc_testforge.agent import (
+  AgentFullFileCandidate,
   AgentMutationProposal,
   build_agent_context,
   filter_agent_mutations,
@@ -80,6 +81,20 @@ class CandidateRecord:
     if self.source_evidence:
       data["source_evidence"] = self.source_evidence
     return data
+
+
+@dataclass(frozen=True)
+class RejectedFullFileCandidate:
+  index: int
+  candidate: dict[str, Any]
+  reason: str
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "index": self.index,
+      "candidate": self.candidate,
+      "reason": self.reason,
+    }
 
 
 @dataclass(frozen=True)
@@ -548,6 +563,52 @@ def _generate_agent_candidates(
       )
     )
   return candidates, rejections
+
+
+def _full_file_rejection_reason(
+  candidate: AgentFullFileCandidate,
+  *,
+  seed_text: str,
+  seen_texts: set[str],
+  max_size_multiplier: int = 6,
+) -> str | None:
+  stripped_text = candidate.text.strip()
+  if not stripped_text:
+    return "empty candidate text"
+  if "```" in candidate.text:
+    return "candidate text contains Markdown fences"
+  if stripped_text == seed_text.strip():
+    return "candidate is identical to seed"
+  if stripped_text in seen_texts:
+    return "duplicate candidate text"
+  if not _has_run_line(candidate.text):
+    return "missing RUN line"
+  max_size = max(len(seed_text) * max_size_multiplier, 20000)
+  if len(candidate.text) > max_size:
+    return "candidate is too large"
+  if not _has_define_line(candidate.text):
+    return "missing define line"
+  if _has_target_triple(seed_text) and not _has_target_triple(candidate.text):
+    return "candidate removed seed target triple"
+  return None
+
+
+def _has_run_line(text: str) -> bool:
+  return any(
+    line.lstrip().startswith((";", "#")) and "RUN:" in line
+    for line in text.splitlines()
+  )
+
+
+def _has_define_line(text: str) -> bool:
+  return any(re.match(r"^\s*define\b", line) for line in text.splitlines())
+
+
+def _has_target_triple(text: str) -> bool:
+  return any(
+    re.match(r"^\s*target\s+triple\s*=", line)
+    for line in text.splitlines()
+  )
 
 
 def _find_agent_mutation_locations(
