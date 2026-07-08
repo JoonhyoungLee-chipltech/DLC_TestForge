@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from dlc_testforge.agent import AgentFullFileCandidate
+from dlc_testforge.agent import AgentFullFileCandidate, AgentFullFileProposal
 from dlc_testforge.cli import main
 from dlc_testforge.generate import (
   RejectedFullFileCandidate,
@@ -285,6 +285,333 @@ def test_rejected_full_file_candidate_to_dict_preserves_fields():
     "candidate": candidate,
     "reason": "missing RUN line",
   }
+
+
+def test_agent_full_file_dry_run_writes_context_only(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  out_dir = tmp_path / "workspace"
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    out_dir,
+    dry_run=True,
+    profiles_dir=profiles_dir,
+    mode="agent-full-file",
+  )
+
+  assert manifest.mode == "agent-full-file"
+  assert manifest.candidate_count == 0
+  assert manifest.inputs["full_file_agent_context"] == (
+    "inputs/full-file-agent-context.json"
+  )
+  assert "agent_context" not in manifest.inputs
+  assert "agent_proposal" not in manifest.inputs
+  assert "full_file_agent_proposal" not in manifest.inputs
+  assert (out_dir / "inputs" / "full-file-agent-context.json").is_file()
+  assert not (out_dir / "inputs" / "full-file-agent-proposal.json").exists()
+  assert not (out_dir / "results" / "full-file-agent-rejections.json").exists()
+  assert list((out_dir / "candidates").iterdir()) == []
+
+
+def test_agent_full_file_offline_proposal_writes_candidate_and_metadata(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  proposal_path = tmp_path / "full-file-proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "candidates": [
+          {
+            "filename": "suggested-name.ll",
+            "text": (
+              "; RUN: llc -mtriple=dlc < %s | FileCheck %s\n"
+              "define void @candidate() {\n"
+              "  ret void\n"
+              "}\n\n"
+            ),
+            "rationale": "write a complete candidate",
+            "intended_stress": "full-file workspace integration",
+            "evidence_tags": ["addr_exp_boundary"],
+            "source_evidence": "kernel evidence",
+          }
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace",
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    mode="agent-full-file",
+    agent_full_file_proposal=proposal_path,
+  )
+
+  assert manifest.candidate_count == 1
+  assert manifest.inputs["full_file_agent_context"] == (
+    "inputs/full-file-agent-context.json"
+  )
+  assert manifest.inputs["full_file_agent_proposal"] == (
+    "inputs/full-file-agent-proposal.json"
+  )
+  candidate = manifest.candidates[0]
+  assert candidate.path == "candidates/candidate-0001.ll"
+  assert candidate.mutation_axis == "agent_full_file"
+  assert candidate.source_value == 0
+  assert candidate.new_value == 0
+  assert candidate.line == 1
+  assert candidate.comment == "; DLC-MUTATION: profile=example mode=agent-full-file"
+  assert candidate.suggested_filename == "suggested-name.ll"
+  assert candidate.rationale == "write a complete candidate"
+  assert candidate.intended_stress == "full-file workspace integration"
+  assert candidate.evidence_tags == ["addr_exp_boundary"]
+  assert candidate.source_evidence == "kernel evidence"
+  candidate_text = (
+    tmp_path / "workspace" / "candidates" / "candidate-0001.ll"
+  ).read_text(encoding="utf-8")
+  assert candidate_text.endswith("\n")
+  assert not candidate_text.endswith("\n\n")
+  manifest_json = json.loads(
+    (tmp_path / "workspace" / "manifest.json").read_text(encoding="utf-8")
+  )
+  assert manifest_json["candidates"][0]["suggested_filename"] == "suggested-name.ll"
+  assert manifest_json["candidates"][0]["intended_stress"] == (
+    "full-file workspace integration"
+  )
+
+
+def test_agent_full_file_records_rejections(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  proposal_path = tmp_path / "full-file-proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "candidates": [
+          {
+            "filename": "missing-run.ll",
+            "text": "define void @candidate() { ret void }\n",
+            "rationale": "missing run",
+            "intended_stress": "quality gate",
+          },
+          {
+            "filename": "valid.ll",
+            "text": (
+              "; RUN: llc -mtriple=dlc < %s | FileCheck %s\n"
+              "define void @candidate() { ret void }\n"
+            ),
+            "rationale": "valid",
+            "intended_stress": "accepted candidate",
+          },
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace",
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    mode="agent-full-file",
+    agent_full_file_proposal=proposal_path,
+  )
+
+  assert manifest.candidate_count == 1
+  rejections = json.loads(
+    (
+      tmp_path / "workspace" / "results" / "full-file-agent-rejections.json"
+    ).read_text(encoding="utf-8")
+  )
+  assert rejections["rejection_count"] == 1
+  assert rejections["rejections"][0]["index"] == 0
+  assert rejections["rejections"][0]["reason"] == "missing RUN line"
+
+
+def test_agent_full_file_rejects_seed_duplicate(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  seed_text = (
+    llvm_root / "llvm" / "test" / "CodeGen" / "DLC" / "example.ll"
+  ).read_text(encoding="utf-8")
+  proposal_path = tmp_path / "full-file-proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "candidates": [
+          {
+            "filename": "same-as-seed.ll",
+            "text": seed_text,
+            "rationale": "duplicate seed",
+            "intended_stress": "quality gate",
+          }
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace",
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    mode="agent-full-file",
+    agent_full_file_proposal=proposal_path,
+  )
+
+  assert manifest.candidate_count == 0
+  rejections = json.loads(
+    (
+      tmp_path / "workspace" / "results" / "full-file-agent-rejections.json"
+    ).read_text(encoding="utf-8")
+  )
+  assert rejections["rejections"][0]["reason"] == "candidate is identical to seed"
+
+
+def test_agent_full_file_proposal_seed_profile_mismatch_fails(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  proposal_path = tmp_path / "full-file-proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/other.ll",
+        "profile": "example",
+        "candidates": [],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  try:
+    create_workspace(
+      llvm_root,
+      "example",
+      "llvm/test/CodeGen/DLC/example.ll",
+      tmp_path / "workspace",
+      dry_run=False,
+      profiles_dir=profiles_dir,
+      mode="agent-full-file",
+      agent_full_file_proposal=proposal_path,
+    )
+  except ValueError as exc:
+    assert "does not match requested seed" in str(exc)
+  else:
+    raise AssertionError("expected ValueError")
+
+
+def test_agent_full_file_live_request_path_writes_artifacts(tmp_path, monkeypatch):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+
+  def fake_request(context, *, model, endpoint, max_candidates):
+    assert context["seed"]["path"] == "llvm/test/CodeGen/DLC/example.ll"
+    assert model == "test-model"
+    assert endpoint == "https://example.test/v1"
+    assert max_candidates == 2
+    return AgentFullFileProposal(
+      seed="llvm/test/CodeGen/DLC/example.ll",
+      profile="example",
+      candidates=[
+        AgentFullFileCandidate(
+          filename="live.ll",
+          text=(
+            "; RUN: llc -mtriple=dlc < %s | FileCheck %s\n"
+            "define void @candidate() { ret void }\n"
+          ),
+          rationale="live request candidate",
+          intended_stress="live request",
+        )
+      ],
+    )
+
+  monkeypatch.setattr(
+    "dlc_testforge.generate.request_agent_full_file_proposal",
+    fake_request,
+  )
+
+  manifest = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace",
+    dry_run=False,
+    profiles_dir=profiles_dir,
+    mode="agent-full-file",
+    agent_model="test-model",
+    agent_endpoint="https://example.test/v1",
+    max_candidates=2,
+  )
+
+  assert manifest.candidate_count == 1
+  assert (tmp_path / "workspace" / "inputs" / "full-file-agent-proposal.json").is_file()
+  assert (tmp_path / "workspace" / "candidates" / "candidate-0001.ll").is_file()
+
+
+def test_agent_full_file_context_includes_kernel_evidence_when_provided(tmp_path):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  kernel_usage_index = _write_kernel_usage_index(tmp_path)
+
+  without_evidence = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace-no-evidence",
+    dry_run=True,
+    profiles_dir=profiles_dir,
+    mode="agent-full-file",
+  )
+  with_evidence = create_workspace(
+    llvm_root,
+    "example",
+    "llvm/test/CodeGen/DLC/example.ll",
+    tmp_path / "workspace-with-evidence",
+    dry_run=True,
+    profiles_dir=profiles_dir,
+    mode="agent-full-file",
+    kernel_usage_index=kernel_usage_index,
+  )
+
+  assert "kernel_usage_index" not in without_evidence.inputs
+  assert with_evidence.inputs["kernel_usage_index"] == "inputs/kernel-usage-index.json"
+  base_context = json.loads(
+    (
+      tmp_path
+      / "workspace-no-evidence"
+      / "inputs"
+      / "full-file-agent-context.json"
+    ).read_text(encoding="utf-8")
+  )
+  context = json.loads(
+    (
+      tmp_path
+      / "workspace-with-evidence"
+      / "inputs"
+      / "full-file-agent-context.json"
+    ).read_text(encoding="utf-8")
+  )
+  assert "kernel_usage_evidence" not in base_context
+  assert context["kernel_usage_evidence"]["selection"]["selected_count"] == 1
 
 
 def test_dry_run_creates_workspace_snapshots_and_no_candidates(tmp_path):

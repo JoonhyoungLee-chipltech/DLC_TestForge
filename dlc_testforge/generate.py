@@ -10,10 +10,14 @@ from typing import Any
 
 from dlc_testforge.agent import (
   AgentFullFileCandidate,
+  AgentFullFileProposal,
   AgentMutationProposal,
   build_agent_context,
+  build_full_file_agent_context,
   filter_agent_mutations,
+  load_agent_full_file_proposal,
   load_agent_proposal,
+  request_agent_full_file_proposal,
   request_agent_proposal,
   select_kernel_evidence,
   write_agent_json,
@@ -60,6 +64,8 @@ class CandidateRecord:
   edits: list[dict[str, Any]] | None = None
   evidence_tags: list[str] | None = None
   source_evidence: str | None = None
+  suggested_filename: str | None = None
+  intended_stress: str | None = None
 
   def to_dict(self) -> dict[str, Any]:
     data = {
@@ -80,6 +86,10 @@ class CandidateRecord:
       data["evidence_tags"] = self.evidence_tags
     if self.source_evidence:
       data["source_evidence"] = self.source_evidence
+    if self.suggested_filename:
+      data["suggested_filename"] = self.suggested_filename
+    if self.intended_stress:
+      data["intended_stress"] = self.intended_stress
     return data
 
 
@@ -142,14 +152,15 @@ def create_workspace(
   max_candidates: int = 10,
   mode: str = "manual",
   agent_proposal: Path | None = None,
+  agent_full_file_proposal: Path | None = None,
   agent_model: str | None = None,
   agent_endpoint: str | None = None,
   kernel_usage_index: Path | None = None,
 ) -> WorkspaceManifest:
   if max_candidates < 1:
     raise ValueError("max-candidates must be at least 1")
-  if mode not in {"manual", "agent"}:
-    raise ValueError("mode must be one of: manual, agent")
+  if mode not in {"manual", "agent", "agent-full-file"}:
+    raise ValueError("mode must be one of: manual, agent, agent-full-file")
 
   llvm_root = llvm_root.expanduser().resolve(strict=False)
   out_dir = out_dir.expanduser().resolve(strict=False)
@@ -205,6 +216,7 @@ def create_workspace(
 
   candidates = []
   seed_text = seed_path.read_text(encoding="utf-8")
+  full_file_context = None
   if mode == "agent":
     context = build_agent_context(
       profile,
@@ -217,6 +229,22 @@ def create_workspace(
       kernel_usage_evidence=selected_kernel_evidence,
     )
     write_agent_json(inputs_dir / "agent-context.json", context)
+  elif mode == "agent-full-file":
+    full_file_context = build_full_file_agent_context(
+      profile,
+      seed_relative,
+      seed_text,
+      max_candidates,
+      llvm_root=llvm_root,
+      test_index=test_index.to_dict(),
+      spec_index=spec_index.to_dict(),
+      td_index=td_index.to_dict(),
+      kernel_usage_evidence=selected_kernel_evidence,
+    )
+    write_agent_json(
+      inputs_dir / "full-file-agent-context.json",
+      full_file_context,
+    )
 
   if not dry_run:
     if mode == "manual":
@@ -229,7 +257,7 @@ def create_workspace(
         max_candidates,
         kernel_usage_evidence=selected_kernel_evidence,
       )
-    else:
+    elif mode == "agent":
       if agent_proposal is not None:
         proposal = load_agent_proposal(agent_proposal)
       else:
@@ -258,6 +286,40 @@ def create_workspace(
           ] + application_rejections,
         },
       )
+    else:
+      if agent_full_file_proposal is not None:
+        proposal = load_agent_full_file_proposal(
+          agent_full_file_proposal,
+          seed_relative=seed_relative,
+          profile_name=profile.name,
+          max_candidates=max_candidates,
+        )
+      else:
+        proposal = request_agent_full_file_proposal(
+          full_file_context or {},
+          model=agent_model,
+          endpoint=agent_endpoint,
+          max_candidates=max_candidates,
+        )
+      write_agent_json(
+        inputs_dir / "full-file-agent-proposal.json",
+        proposal.to_dict(),
+      )
+      candidates, rejections = _generate_full_file_agent_candidates(
+        proposal,
+        seed_text,
+        seed_relative,
+        profile.name,
+        candidates_dir,
+        max_candidates,
+      )
+      write_agent_json(
+        results_dir / "full-file-agent-rejections.json",
+        {
+          "rejection_count": len(rejections),
+          "rejections": [entry.to_dict() for entry in rejections],
+        },
+      )
 
   created_at = datetime.now(timezone.utc).replace(microsecond=0)
   manifest = WorkspaceManifest(
@@ -284,8 +346,18 @@ def create_workspace(
       ),
       **({"agent_context": "inputs/agent-context.json"} if mode == "agent" else {}),
       **(
+        {"full_file_agent_context": "inputs/full-file-agent-context.json"}
+        if mode == "agent-full-file"
+        else {}
+      ),
+      **(
         {"agent_proposal": "inputs/agent-proposal.json"}
         if mode == "agent" and not dry_run
+        else {}
+      ),
+      **(
+        {"full_file_agent_proposal": "inputs/full-file-agent-proposal.json"}
+        if mode == "agent-full-file" and not dry_run
         else {}
       ),
     },
@@ -562,6 +634,71 @@ def _generate_agent_candidates(
         ],
       )
     )
+  return candidates, rejections
+
+
+def _generate_full_file_agent_candidates(
+  proposal: AgentFullFileProposal,
+  seed_text: str,
+  seed_relative: str,
+  profile_name: str,
+  candidates_dir: Path,
+  max_candidates: int,
+) -> tuple[list[CandidateRecord], list[RejectedFullFileCandidate]]:
+  candidates: list[CandidateRecord] = []
+  rejections: list[RejectedFullFileCandidate] = []
+  seen_texts: set[str] = set()
+
+  for index, candidate in enumerate(proposal.candidates):
+    reason = _full_file_rejection_reason(
+      candidate,
+      seed_text=seed_text,
+      seen_texts=seen_texts,
+    )
+    if reason is not None:
+      rejections.append(
+        RejectedFullFileCandidate(
+          index=index,
+          candidate=candidate.to_dict(),
+          reason=reason,
+        )
+      )
+      continue
+    if len(candidates) >= max_candidates:
+      rejections.append(
+        RejectedFullFileCandidate(
+          index=index,
+          candidate=candidate.to_dict(),
+          reason="mutation budget exhausted",
+        )
+      )
+      continue
+
+    candidate_number = len(candidates) + 1
+    filename = f"candidate-{candidate_number:04d}.ll"
+    text = candidate.text.rstrip() + "\n"
+    candidate_path = candidates_dir / filename
+    candidate_path.write_text(text, encoding="utf-8")
+    seen_texts.add(candidate.text.strip())
+    comment = f"; DLC-MUTATION: profile={profile_name} mode=agent-full-file"
+    candidates.append(
+      CandidateRecord(
+        path=f"candidates/{filename}",
+        seed=seed_relative,
+        profile=profile_name,
+        mutation_axis="agent_full_file",
+        source_value=0,
+        new_value=0,
+        line=1,
+        comment=comment,
+        rationale=candidate.rationale,
+        evidence_tags=candidate.evidence_tags,
+        source_evidence=candidate.source_evidence,
+        suggested_filename=candidate.filename,
+        intended_stress=candidate.intended_stress,
+      )
+    )
+
   return candidates, rejections
 
 
