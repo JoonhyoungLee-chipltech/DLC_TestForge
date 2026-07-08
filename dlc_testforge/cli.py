@@ -171,6 +171,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
       max_candidates=args.max_candidates,
       mode=args.mode,
       agent_proposal=args.agent_proposal,
+      agent_full_file_proposal=args.agent_full_file_proposal,
       agent_model=args.agent_model,
       agent_endpoint=args.agent_endpoint,
       kernel_usage_index=args.kernel_usage_index,
@@ -396,15 +397,27 @@ def build_parser() -> argparse.ArgumentParser:
   )
   generate_parser.add_argument(
     "--mode",
-    choices=["manual", "agent"],
+    choices=["manual", "agent", "agent-full-file"],
     default="manual",
-    help="Generation mode. Agent mode asks for structured mutation proposals before writing candidates.",
+    help=(
+      "Generation mode. Agent mode asks for structured mutation proposals; "
+      "agent-full-file asks for complete .ll candidates."
+    ),
   )
   generate_parser.add_argument(
     "--agent-proposal",
     type=Path,
     default=None,
     help="Optional JSON proposal file for agent mode. Skips the LLM request.",
+  )
+  generate_parser.add_argument(
+    "--agent-full-file-proposal",
+    type=Path,
+    default=None,
+    help=(
+      "Optional JSON full-file proposal file for agent-full-file mode. "
+      "Skips the LLM request."
+    ),
   )
   generate_parser.add_argument(
     "--agent-model",

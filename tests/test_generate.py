@@ -1271,6 +1271,121 @@ def test_cli_generate_agent_mode_outputs_json(tmp_path, capsys):
   assert (out_dir / "results" / "agent-rejections.json").is_file()
 
 
+def test_cli_generate_help_includes_agent_full_file(capsys):
+  try:
+    main(["generate", "--help"])
+  except SystemExit as exc:
+    assert exc.code == 0
+  else:
+    raise AssertionError("expected SystemExit")
+
+  captured = capsys.readouterr()
+  assert "agent-full-file" in captured.out
+  assert "--agent-full-file-proposal" in captured.out
+
+
+def test_cli_generate_agent_full_file_outputs_json(tmp_path, capsys):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  out_dir = tmp_path / "workspace"
+  proposal_path = tmp_path / "full-file-proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/example.ll",
+        "profile": "example",
+        "candidates": [
+          {
+            "filename": "suggested.ll",
+            "text": (
+              "; RUN: llc -mtriple=dlc < %s | FileCheck %s\n"
+              "define void @candidate() { ret void }\n"
+            ),
+            "rationale": "CLI full-file proposal",
+            "intended_stress": "CLI integration",
+          }
+        ],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  assert (
+    main(
+      [
+        "generate",
+        "--llvm-root",
+        str(llvm_root),
+        "--profile",
+        "example",
+        "--seed",
+        "llvm/test/CodeGen/DLC/example.ll",
+        "--out-dir",
+        str(out_dir),
+        "--profiles-dir",
+        str(profiles_dir),
+        "--mode",
+        "agent-full-file",
+        "--agent-full-file-proposal",
+        str(proposal_path),
+      ]
+    )
+    == 0
+  )
+
+  captured = capsys.readouterr()
+  result = json.loads(captured.out)
+  assert result["status"] == "generated"
+  assert result["candidate_count"] == 1
+  assert (out_dir / "candidates" / "candidate-0001.ll").is_file()
+  assert (out_dir / "inputs" / "full-file-agent-context.json").is_file()
+  assert (out_dir / "inputs" / "full-file-agent-proposal.json").is_file()
+  assert (out_dir / "results" / "full-file-agent-rejections.json").is_file()
+
+
+def test_cli_generate_agent_full_file_invalid_proposal_exits_nonzero(
+  tmp_path, capsys
+):
+  llvm_root = _make_llvm_root(tmp_path)
+  profiles_dir = _make_profiles_dir(tmp_path)
+  proposal_path = tmp_path / "full-file-proposal.json"
+  proposal_path.write_text(
+    json.dumps(
+      {
+        "seed": "llvm/test/CodeGen/DLC/other.ll",
+        "profile": "example",
+        "candidates": [],
+      }
+    ),
+    encoding="utf-8",
+  )
+
+  assert (
+    main(
+      [
+        "generate",
+        "--llvm-root",
+        str(llvm_root),
+        "--profile",
+        "example",
+        "--seed",
+        "llvm/test/CodeGen/DLC/example.ll",
+        "--out-dir",
+        str(tmp_path / "workspace"),
+        "--profiles-dir",
+        str(profiles_dir),
+        "--mode",
+        "agent-full-file",
+        "--agent-full-file-proposal",
+        str(proposal_path),
+      ]
+    )
+    == 2
+  )
+
+  assert "error:" in capsys.readouterr().err
+
+
 def test_agent_mode_includes_kernel_usage_evidence_when_provided(tmp_path):
   llvm_root = _make_llvm_root(tmp_path)
   profiles_dir = _make_profiles_dir(tmp_path)
